@@ -7,6 +7,7 @@ mod parsers;
 /// 生 TUI（crossterm、3 秒更新）。
 mod tui;
 
-fn main() {
-    println!("Hello, world!");
+/// プログラム入口。TUI を起動する。
+fn main() -> std::io::Result<()> {
+    tui::run()
 }
