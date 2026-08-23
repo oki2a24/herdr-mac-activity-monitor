@@ -4,6 +4,8 @@ mod battery;
 mod memory;
 /// 純粋なパース・計算・出力整形（テスト・ファズの主対象）。
 mod parsers;
+/// 生 TUI（crossterm、3 秒更新）。
+mod tui;
 
 fn main() {
     println!("Hello, world!");
