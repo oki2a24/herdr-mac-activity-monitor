@@ -10,7 +10,7 @@ Activity Monitor で確認していた「使用済みメモリ」「バッテリ
 ## インストール
 
 ```bash
-herdr plugin install https://github.com/<user>/herdr-mac-activity-monitor
+herdr plugin install oki2a24/herdr-mac-activity-monitor
 ```
 
 インストール完了後、プラグインが有効になります。
@@ -24,7 +24,7 @@ herdr plugin update localmac.activity-monitor
 または手動で最新版を取得：
 
 ```bash
-herdr plugin install https://github.com/<user>/herdr-mac-activity-monitor
+herdr plugin install oki2a24/herdr-mac-activity-monitor
 ```
 
 ## アンインストール
