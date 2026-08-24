@@ -11,4 +11,4 @@ title = "Activity Monitor"
 placement = "popup"
 width = "80%"
 height = 60
-command = ["herdr-activity-monitor"]
+command = ["bin/herdr-activity-monitor"]
