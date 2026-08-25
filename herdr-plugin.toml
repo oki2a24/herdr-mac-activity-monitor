@@ -1,6 +1,6 @@
 id = "localmac.activity-monitor"
 name = "Activity Monitor"
-version = "0.1.0"
+version = "0.1.1"
 min_herdr_version = "0.7.3"
 description = "macOS 使用メモリ・バッテリーをHerdr popupに表示"
 platforms = ["macos"]
@@ -12,3 +12,15 @@ placement = "popup"
 width = "80%"
 height = 60
 command = ["./bin/herdr-activity-monitor"]
+
+[[actions]]
+id = "toggle-monitor"
+title = "Toggle Activity Monitor"
+contexts = ["workspace"]
+command = ["bash", "-c", "HERDR_BIN_PATH=\"${HERDR_BIN_PATH}\"; \"${HERDR_BIN_PATH}\" plugin pane open --plugin localmac.activity-monitor --entrypoint monitor"]
+
+[[keys.command]]
+key = "prefix+m"
+type = "plugin_action"
+command = "localmac.activity-monitor.toggle-monitor"
+description = "toggle activity monitor popup"
