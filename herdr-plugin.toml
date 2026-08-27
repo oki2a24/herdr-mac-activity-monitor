@@ -18,9 +18,3 @@ id = "toggle-monitor"
 title = "Toggle Activity Monitor"
 contexts = ["workspace"]
 command = ["bash", "-c", "HERDR_BIN_PATH=\"${HERDR_BIN_PATH}\"; \"${HERDR_BIN_PATH}\" plugin pane open --plugin localmac.activity-monitor --entrypoint monitor"]
-
-[[keys.command]]
-key = "prefix+m"
-type = "plugin_action"
-command = "localmac.activity-monitor.toggle-monitor"
-description = "toggle activity monitor popup"
