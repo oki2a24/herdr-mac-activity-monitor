@@ -17,11 +17,7 @@ herdr plugin install oki2a24/herdr-mac-activity-monitor
 
 ## アップデート
 
-```bash
-herdr plugin update localmac.activity-monitor
-```
-
-または手動で最新版を取得：
+Herdr v1 にはプラグイン更新コマンドはないため、最新版を再インストールしてください。
 
 ```bash
 herdr plugin install oki2a24/herdr-mac-activity-monitor
@@ -50,7 +46,7 @@ Memory    29.80 GB / 34.36 GB   87%
 Battery    83%   discharging
 ```
 
-- `q` / `Esc` / `Ctrl-C` で終了
+- `q` / `Esc` で終了
 - 3 秒ごとに自動更新
 
 ## 技術仕様
