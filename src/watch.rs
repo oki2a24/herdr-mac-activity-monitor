@@ -13,6 +13,20 @@ pub fn should_exit(failed_count: u32, max_fail: u32, socket_exists: bool) -> boo
     failed_count > max_fail
 }
 
+/// 与えられた pid が生きていれば `true`。`pid == 0` は `false`。
+/// Unix では `kill -0 <pid>` の結果で判定する（シグナルは実際に送らない）。
+pub fn is_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let status = std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .output()
+        .map(|o| o.status.success());
+    status.unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -33,5 +47,18 @@ mod tests {
     fn exits_when_socket_present_and_over_threshold() {
         assert!(should_exit(6, 5, true));
         assert!(should_exit(100, 5, true));
+    }
+
+    #[test]
+    fn current_process_alive() {
+        let pid = std::process::id();
+        assert!(is_pid_alive(pid));
+    }
+
+    #[test]
+    fn dead_pid_not_alive() {
+        // 非常に高確率で未使用の pid。確実に死んだ pid は取得できないため
+        // `kill -0` の挙動（no such process）を信じて false を期待する。
+        assert!(!is_pid_alive(0));
     }
 }
