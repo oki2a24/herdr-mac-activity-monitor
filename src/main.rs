@@ -9,7 +9,12 @@ mod parsers;
 mod tui;
 mod watch;
 
-/// プログラム入口。TUI を起動する。
+/// プログラム入口。--watch で watch デーモン、それ以外で TUI を起動する。
 fn main() -> std::io::Result<()> {
-    tui::run()
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--watch") {
+        watch::run()
+     } else {
+        tui::run()
+    }
 }
