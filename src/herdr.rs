@@ -22,8 +22,8 @@ pub fn set_request(title: &str) -> String {
     format!(
         r#"{{"jsonrpc":"2.0","id":"window_title_set","method":"client.window_title.set","params":{{"title":"{}"}}}}"#,
         json_escape(title)
-     )
- }
+    )
+}
 
 /// `client.window_title.clear` の JSON-RPC リクエスト（1行・空 params）を生成する。
 pub fn clear_request() -> String {
@@ -52,22 +52,22 @@ pub fn clear_window_title() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-     #[test]
+    #[test]
     fn set_request_shape() {
         let s = set_request("abc");
         assert!(s.contains("client.window_title.set"));
         assert!(s.contains(r#""id":"window_title_set""#));
         assert!(s.contains("params"));
         assert!(s.contains("abc"));
-      }
+    }
 
-     #[test]
+    #[test]
     fn clear_request_shape() {
         let s = clear_request();
         assert!(s.contains("client.window_title.clear"));
         assert!(s.contains(r#""id":"window_title_clear""#));
         assert!(s.contains("params"));
-      }
+    }
 
     #[test]
     fn set_request_escapes_special_chars_single_line() {

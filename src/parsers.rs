@@ -326,7 +326,7 @@ mod tests {
     fn fuzz_format_lines_four_lines_never_panic() {
         let mut r = Lcg::new(0xF4);
         for _ in 0..5000 {
-            let m = if r.next() % 2 == 0 {
+            let m = if r.next().is_multiple_of(2) {
                 Some(MemInfo {
                     used_gb: r.next() as f64 / 1e6,
                     total_gb: r.next() as f64 / 1e6,
@@ -335,7 +335,7 @@ mod tests {
             } else {
                 None
             };
-            let b = if r.next() % 2 == 0 {
+            let b = if r.next().is_multiple_of(2) {
                 Battery::Present {
                     percent: r.next() as u8,
                     state: ChargingState::Charging,

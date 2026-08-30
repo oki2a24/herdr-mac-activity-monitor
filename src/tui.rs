@@ -36,16 +36,12 @@ fn run_loop<F: std::io::Write>(out: &mut F) -> std::io::Result<()> {
         out.flush().ok();
         // 入力待ち 3 秒。入力があれば読み取り、キーなら q/Esc で抜ける、
         // 別のイベントなら継続。タイムアウトなら次の 3 秒で再更新。
-        match event::poll(tick) {
-            Ok(true) => {
-                if let event::Event::Key(k) = event::read()? {
-                    match k.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
-                        _ => {}
-                    }
+        if let Ok(true) = event::poll(tick) {
+            if let event::Event::Key(k) = event::read()? {
+                if matches!(k.code, KeyCode::Char('q') | KeyCode::Esc) {
+                    break;
                 }
             }
-            Ok(false) | Err(_) => {}
         }
     }
     Ok(())

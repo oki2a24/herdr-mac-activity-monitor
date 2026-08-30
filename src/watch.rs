@@ -1,7 +1,6 @@
 //! window title 常時更新の watch デーモン。
- //! タイトル操作に集中し、`memory` / `battery` / `parsers` / `herdr` を再利用する。
+//! タイトル操作に集中し、`memory` / `battery` / `parsers` / `herdr` を再利用する。
 use std::fs;
-use std::env;
 
 /// 接続断（サーバ停止）または連続失敗閾値超過で終了判定する。
 /// `socket_exists == false` は即終了。`socket_exists == true` なら
@@ -33,24 +32,19 @@ pub fn is_pid_alive(pid: u32) -> bool {
 pub fn acquire_watch_lock() -> bool {
     let dir = match std::env::var_os("HERDR_PLUGIN_STATE_DIR") {
         Some(d) => d,
-         None => return true,
-      };
+        None => return true,
+    };
     let pid_file = std::path::Path::new(&dir).join("watch.pid");
     let raw = fs::read_to_string(&pid_file);
     match raw {
         Ok(_) => {
-            let existing: u32 = raw
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(0);
+            let existing: u32 = raw.ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
             if is_pid_alive(existing) {
                 return false;
             }
             fs::write(&pid_file, std::process::id().to_string()).is_ok()
-         }
-         Err(_) => {
-            fs::write(&pid_file, std::process::id().to_string()).is_ok()
-      }
+        }
+        Err(_) => fs::write(&pid_file, std::process::id().to_string()).is_ok(),
     }
 }
 
@@ -60,7 +54,7 @@ pub fn run() -> std::io::Result<()> {
     use std::thread;
     if !acquire_watch_lock() {
         return Ok(());
-     }
+    }
     let mut failed: u32 = 0;
     loop {
         let mem = crate::memory::get().ok();
@@ -71,15 +65,17 @@ pub fn run() -> std::io::Result<()> {
             Err(e) => {
                 failed += 1;
                 eprintln!("warn: failed to set window title: {e}");
-                let socket = std::env::var_os("HERDR_SOCKET_PATH")
-                    .and_then(|p| fs::metadata(p).ok());
+                let socket =
+                    std::env::var_os("HERDR_SOCKET_PATH").and_then(|p| fs::metadata(p).ok());
                 if should_exit(failed, 3, socket.is_some()) {
                     break;
-                 }
+                }
             }
         }
         thread::sleep(std::time::Duration::from_secs(3));
-     }
+    }
+    // 接続断・連続失敗でループを終了したら、セットしていた window title をクリアする。
+    crate::herdr::clear_window_title().ok();
     Ok(())
 }
 
@@ -87,7 +83,10 @@ pub fn run() -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::env;
-    use std::path::Path;
+
+    // HERDR_PLUGIN_STATE_DIR はプロセス全体に共有されるため、
+    // 3つのテストを直列化してデータを競合させない。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn exits_when_socket_gone() {
@@ -122,6 +121,7 @@ mod tests {
 
     #[test]
     fn unsets_env_returns_true() {
+        let _g = ENV_LOCK.lock().unwrap();
         env::remove_var("HERDR_PLUGIN_STATE_DIR");
         assert!(acquire_watch_lock());
     }
@@ -129,6 +129,7 @@ mod tests {
     #[test]
     fn acquires_when_no_existing_pid() {
         use std::env::temp_dir;
+        let _g = ENV_LOCK.lock().unwrap();
         let dir = temp_dir().join(format!("am-watch-t3-{}", std::process::id()));
         env::set_var("HERDR_PLUGIN_STATE_DIR", &dir);
         fs::create_dir_all(&dir).unwrap();
@@ -142,13 +143,14 @@ mod tests {
     #[test]
     fn blocks_when_live_pid_present() {
         use std::env::temp_dir;
+        let _g = ENV_LOCK.lock().unwrap();
         let dir = temp_dir().join(format!("am-watch-t3b-{}", std::process::id()));
         env::set_var("HERDR_PLUGIN_STATE_DIR", &dir);
         fs::create_dir_all(&dir).unwrap();
-         // 生 pid を仮置き（自 pid）。
+        // 生 pid を仮置き（自 pid）。
         fs::write(dir.join("watch.pid"), std::process::id().to_string()).unwrap();
         assert!(!acquire_watch_lock());
-         // 死者 pid（pid 0）なら上書きできる。
+        // 死者 pid（pid 0）なら上書きできる。
         fs::write(dir.join("watch.pid"), "0").unwrap();
         assert!(acquire_watch_lock());
         env::remove_var("HERDR_PLUGIN_STATE_DIR");

@@ -14,7 +14,7 @@ fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--watch") {
         watch::run()
-     } else {
+    } else {
         tui::run()
     }
 }
