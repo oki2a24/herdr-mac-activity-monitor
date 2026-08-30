@@ -18,6 +18,7 @@ pub fn run() -> std::io::Result<()> {
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, Hide)?;
     let result = run_loop(&mut stdout);
+    crate::herdr::clear_window_title().ok();
     disable_raw_mode()?;
     execute!(stdout, LeaveAlternateScreen, Show)?;
     result
@@ -34,6 +35,10 @@ fn run_loop<F: std::io::Write>(out: &mut F) -> std::io::Result<()> {
             execute!(out, Print(l), Print("\n"))?;
         }
         out.flush().ok();
+        let window_title = crate::parsers::format_window_title(&mem, &batt);
+        if let Err(e) = crate::herdr::set_window_title(&window_title) {
+            eprintln!("warn: failed to set window title: {e}");
+        }
         // 入力待ち 3 秒。入力があれば読み取り、キーなら q/Esc で抜ける、
         // 別のイベントなら継続。タイムアウトなら次の 3 秒で再更新。
         match event::poll(tick) {

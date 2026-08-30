@@ -147,9 +147,26 @@ pub fn format_lines(m: &Option<MemInfo>, b: &Battery) -> Vec<String> {
     ]
 }
 
+/// ウィンドウタイトル用の1行文字列を生成する。
+/// 形式: "Memory USED/TOTALGB PERCENT% | Battery PERCENT% STATE"。
+/// Memory 欠損は "Memory n/a"、Battery 欠損は "... | Battery n/a"。
+pub fn format_window_title(m: &Option<crate::parsers::MemInfo>, b: &Battery) -> String {
+    let mem_part = match m {
+        Some(x) => format!("{:.2}/{:.2}GB {}%", x.used_gb, x.total_gb, x.percent),
+        None => "n/a".to_string(),
+    };
+    let batt_part = match b {
+        Battery::Present { percent, state } => {
+            format!("{}% {}", percent, state.as_str())
+        }
+        Battery::Absent => "n/a".to_string(),
+    };
+    format!("Memory {} | Battery {}", mem_part, batt_part)
+}
+
 impl ChargingState {
     /// 充電状態を表す小文字英語の固定文字列を返す。
-    fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             ChargingState::Charging => "charging",
             ChargingState::Discharging => "discharging",
@@ -466,5 +483,47 @@ mod fmt {
         };
         let lines = format_lines(&Some(m), &Battery::Absent);
         assert_eq!(lines[3], "Battery   n/a");
+    }
+
+    #[test]
+    fn present() {
+        let m = MemInfo {
+            used_gb: 29.80,
+            total_gb: 34.36,
+            percent: 87,
+        };
+        let b = Battery::Present {
+            percent: 83,
+            state: ChargingState::Discharging,
+        };
+        assert_eq!(
+            format_window_title(&Some(m), &b),
+            "Memory 29.80/34.36GB 87% | Battery 83% discharging"
+        );
+    }
+
+    #[test]
+    fn memory_missing() {
+        let b = Battery::Present {
+            percent: 83,
+            state: ChargingState::Discharging,
+        };
+        assert_eq!(
+            format_window_title(&None, &b),
+            "Memory n/a | Battery 83% discharging"
+        );
+    }
+
+    #[test]
+    fn battery_absent() {
+        let m = MemInfo {
+            used_gb: 29.80,
+            total_gb: 34.36,
+            percent: 87,
+        };
+        assert_eq!(
+            format_window_title(&Some(m), &Battery::Absent),
+            "Memory 29.80/34.36GB 87% | Battery n/a"
+        );
     }
 }
