@@ -7,6 +7,7 @@ mod memory;
 mod parsers;
 /// 生 TUI（crossterm、3 秒更新）。
 mod tui;
+mod watch;
 
 /// プログラム入口。TUI を起動する。
 fn main() -> std::io::Result<()> {
