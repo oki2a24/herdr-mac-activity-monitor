@@ -1,7 +1,7 @@
 # Persistent Window Title Design
 
 - 日付: 2026-08-30
-- 状態: 承認済み
+- 状態: 実装済み
 - 対象リポジトリ: herdr-mac-activity-monitor
 - 分類: Bounded（既存コードへの限定追加。データ取得・解析・整形は再利用）
 
