@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+       - uses: actions/checkout@v4
+       - name: Install Rust toolchain
+         uses: dtolnay/rust-toolchain@stable
+         with:
+           components: rustfmt, clippy
+       - name: Cache
+         uses: Swatinem/rust-cache@v2
+       - name: Verify
+         run: make verify
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+       - uses: actions/checkout@v4
+       - name: Install Rust toolchain
+         uses: dtolnay/rust-toolchain@stable
+       - name: Install cargo-audit
+         uses: cargo-bins/cargo-binstall@main
+         with:
+           name: cargo-audit
+           args: --no-track
+       - name: Security audit
+         run: make audit
