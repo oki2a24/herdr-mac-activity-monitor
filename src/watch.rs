@@ -54,6 +54,35 @@ pub fn acquire_watch_lock() -> bool {
     }
 }
 
+/// watch デーモン本体。pid ロックを取得できなければ即 return。
+/// 以降は 3 秒周期で タイトルを更新し、接続断または連続失敗で終了する。
+pub fn run() -> std::io::Result<()> {
+    use std::thread;
+    if !acquire_watch_lock() {
+        return Ok(());
+     }
+    let mut failed: u32 = 0;
+    loop {
+        let mem = crate::memory::get().ok();
+        let batt = crate::battery::get();
+        let title = crate::parsers::format_window_title(&mem, &batt);
+        match crate::herdr::set_window_title(&title) {
+            Ok(()) => failed = 0,
+            Err(e) => {
+                failed += 1;
+                eprintln!("warn: failed to set window title: {e}");
+                let socket = std::env::var_os("HERDR_SOCKET_PATH")
+                    .and_then(|p| fs::metadata(p).ok());
+                if should_exit(failed, 3, socket.is_some()) {
+                    break;
+                 }
+            }
+        }
+        thread::sleep(std::time::Duration::from_secs(3));
+     }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +153,5 @@ mod tests {
         assert!(acquire_watch_lock());
         env::remove_var("HERDR_PLUGIN_STATE_DIR");
         let _ = fs::remove_dir_all(&dir);
-     }
+    }
 }
