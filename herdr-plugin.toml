@@ -1,9 +1,12 @@
 id = "localmac.activity-monitor"
 name = "Activity Monitor"
-version = "0.1.2"
+version = "0.1.3"
 min_herdr_version = "0.7.3"
 description = "macOS 使用メモリ・バッテリーをHerdr popupに表示"
 platforms = ["macos"]
+
+[[startup]]
+command = ["./bin/herdr-activity-monitor", "--watch"]
 
 [[panes]]
 id = "monitor"
