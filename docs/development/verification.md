@@ -61,6 +61,15 @@ make audit
 
 `△` は変更内容に応じて判断します。
 
+## version-check
+
+`make version-check` は `Cargo.toml` と `herdr-plugin.toml` の `version` が一致しているかを検証します。
+不一致ならエラー（exit 非0）となり、開発サイクルで取りこぼしを防ぎます。
+
+`make verify` の一部として常に実行されるため、Level 2 以降および CI には必ず含まれます。
+`[[build]]` を使わずバイナリをそのまま配布する本プラグインでは、version の不整合は
+配布パッケージの誤標記につながるため、`make verify`（Level 2, 3, CI）で恒常的にガードします。
+
 ## 検証失敗時のルール
 
 検証に失敗した場合は、以下の順序で対応します。
