@@ -51,7 +51,7 @@ Battery    83%   discharging
 
 v0.1.3 以降、プラグイン起動と同時に `--watch` デーモンが背景で起動し、
 popup を開いていなくても約 3 秒周期で window title に
-`Memory 27.5/32GB 86% | Battery 83% discharging` 形式で反映します。
+`🧠 27.5/32GB 86% | 🔋 83% discharging` 形式で反映します。
 popup は従来どおり `Ctrl+m` で開けます。
 
 デーモンは以下で自然終了します。

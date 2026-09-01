@@ -148,8 +148,8 @@ pub fn format_lines(m: &Option<MemInfo>, b: &Battery) -> Vec<String> {
 }
 
 /// ウィンドウタイトル用の1行文字列を生成する。
-/// 形式: "Memory USED/TOTALGB PERCENT% | Battery PERCENT% STATE"。
-/// Memory 欠損は "Memory n/a"、Battery 欠損は "... | Battery n/a"。
+/// 形式: "🧠 USED/TOTALGB PERCENT% | 🔋 PERCENT% STATE"。
+/// Memory 欠損は "🧠 n/a"、Battery 欠損は "... | 🔋 n/a"。
 pub fn format_window_title(m: &Option<crate::parsers::MemInfo>, b: &Battery) -> String {
     let mem_part = match m {
         Some(x) => format!("{:.2}/{:.2}GB {}%", x.used_gb, x.total_gb, x.percent),
@@ -161,7 +161,7 @@ pub fn format_window_title(m: &Option<crate::parsers::MemInfo>, b: &Battery) -> 
         }
         Battery::Absent => "n/a".to_string(),
     };
-    format!("Memory {} | Battery {}", mem_part, batt_part)
+    format!("🧠 {} | 🔋 {}", mem_part, batt_part)
 }
 
 impl ChargingState {
@@ -498,7 +498,7 @@ mod fmt {
         };
         assert_eq!(
             format_window_title(&Some(m), &b),
-            "Memory 29.80/34.36GB 87% | Battery 83% discharging"
+            "🧠 29.80/34.36GB 87% | 🔋 83% discharging"
         );
     }
 
@@ -510,7 +510,7 @@ mod fmt {
         };
         assert_eq!(
             format_window_title(&None, &b),
-            "Memory n/a | Battery 83% discharging"
+            "🧠 n/a | 🔋 83% discharging"
         );
     }
 
@@ -523,7 +523,7 @@ mod fmt {
         };
         assert_eq!(
             format_window_title(&Some(m), &Battery::Absent),
-            "Memory 29.80/34.36GB 87% | Battery n/a"
+            "🧠 29.80/34.36GB 87% | 🔋 n/a"
         );
     }
 }
