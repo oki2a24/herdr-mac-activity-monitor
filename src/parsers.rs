@@ -124,20 +124,20 @@ pub fn compute_memory(total_pages: u64, psize: u64, vm: VmStat) -> Result<MemInf
 
 /// 状態から表示列の `Vec<String>` を生成する。
 /// 4行固定: タイトル / 罫線 / Memory / Battery。
-/// ラベル(`Memory`/`Battery`)は4スペースで揃え、Battery なしは3スペースの `n/a`。
+/// ラベル(`Memory`/`Battery`)は値の開始列を13固定で揃える（Memory 7スペース、Battery 6スペース）。欠損時も13列に揃い、`?`/`n/a` を表示。
 pub fn format_lines(m: &Option<MemInfo>, b: &Battery) -> Vec<String> {
     let mem_line = match m {
         Some(x) => format!(
-            "Memory    {:.2} GB / {:.2} GB {}%",
+            "Memory       {:.2} GB / {:.2} GB {}%",
             x.used_gb, x.total_gb, x.percent
         ),
-        None => "Memory   ?".to_string(),
+        None => "Memory       ?".to_string(),
     };
     let batt_line = match b {
         Battery::Present { percent, state } => {
-            format!("Battery    {}% {}", percent, state.as_str())
+            format!("Battery      {}% {}", percent, state.as_str())
         }
-        Battery::Absent => "Battery   n/a".to_string(),
+        Battery::Absent => "Battery      n/a".to_string(),
     };
     vec![
         "Activity Monitor".to_string(),
@@ -460,8 +460,8 @@ mod fmt {
         };
         let lines = format_lines(&Some(m), &b);
         assert_eq!(lines.len(), 4);
-        assert_eq!(lines[2], "Memory    29.80 GB / 34.36 GB 87%");
-        assert_eq!(lines[3], "Battery    83% discharging");
+        assert_eq!(lines[2], "Memory       29.80 GB / 34.36 GB 87%");
+        assert_eq!(lines[3], "Battery      83% discharging");
     }
 
     #[test]
@@ -471,7 +471,7 @@ mod fmt {
             state: ChargingState::Charged,
         };
         let lines = format_lines(&None, &b);
-        assert_eq!(lines[2], "Memory   ?");
+        assert_eq!(lines[2], "Memory       ?");
     }
 
     #[test]
@@ -482,7 +482,7 @@ mod fmt {
             percent: 50,
         };
         let lines = format_lines(&Some(m), &Battery::Absent);
-        assert_eq!(lines[3], "Battery   n/a");
+        assert_eq!(lines[3], "Battery      n/a");
     }
 
     #[test]
