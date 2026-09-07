@@ -123,7 +123,7 @@ pub fn compute_memory(total_pages: u64, psize: u64, vm: VmStat) -> Result<MemInf
 }
 
 /// 状態から表示列の `Vec<String>` を生成する。
-/// 4行固定: タイトル / 罫線 / Memory / Battery。
+/// 3行固定: タイトル / Memory / Battery。
 /// ラベル(`Memory`/`Battery`)は値の開始列を9固定で揃える（Memory 3スペース、Battery 2スペース）。
 /// 欠損時も9列に揃い、`?`/`n/a` を表示。
 pub fn format_lines(m: &Option<MemInfo>, b: &Battery) -> Vec<String> {
@@ -140,12 +140,7 @@ pub fn format_lines(m: &Option<MemInfo>, b: &Battery) -> Vec<String> {
         }
         Battery::Absent => "Battery  n/a".to_string(),
     };
-    vec![
-        "Activity Monitor".to_string(),
-        "─────────────────────────────".to_string(),
-        mem_line,
-        batt_line,
-    ]
+    vec!["Activity Monitor".to_string(), mem_line, batt_line]
 }
 
 /// ウィンドウタイトル用の1行文字列を生成する。
@@ -324,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn fuzz_format_lines_four_lines_never_panic() {
+    fn fuzz_format_lines_three_lines_never_panic() {
         let mut r = Lcg::new(0xF4);
         for _ in 0..5000 {
             let m = if r.next().is_multiple_of(2) {
@@ -345,7 +340,7 @@ mod tests {
                 Battery::Absent
             };
             let lines = format_lines(&m, &b);
-            assert_eq!(lines.len(), 4);
+            assert_eq!(lines.len(), 3);
         }
     }
 }
@@ -460,9 +455,10 @@ mod fmt {
             state: ChargingState::Discharging,
         };
         let lines = format_lines(&Some(m), &b);
-        assert_eq!(lines.len(), 4);
-        assert_eq!(lines[2], "Memory   29.80 GB / 34.36 GB 87%");
-        assert_eq!(lines[3], "Battery  83% discharging");
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "Activity Monitor");
+        assert_eq!(lines[1], "Memory   29.80 GB / 34.36 GB 87%");
+        assert_eq!(lines[2], "Battery  83% discharging");
     }
 
     #[test]
@@ -472,7 +468,9 @@ mod fmt {
             state: ChargingState::Charged,
         };
         let lines = format_lines(&None, &b);
-        assert_eq!(lines[2], "Memory   ?");
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "Activity Monitor");
+        assert_eq!(lines[1], "Memory   ?");
     }
 
     #[test]
@@ -483,7 +481,10 @@ mod fmt {
             percent: 50,
         };
         let lines = format_lines(&Some(m), &Battery::Absent);
-        assert_eq!(lines[3], "Battery  n/a");
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "Activity Monitor");
+        assert_eq!(lines[1], "Memory   1.00 GB / 2.00 GB 50%");
+        assert_eq!(lines[2], "Battery  n/a");
     }
 
     #[test]
