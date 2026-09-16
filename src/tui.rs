@@ -53,7 +53,8 @@ fn run_loop<F: std::io::Write>(out: &mut F) -> std::io::Result<()> {
 fn render_frame<F: std::io::Write>(out: &mut F, lines: &[String]) -> std::io::Result<()> {
     execute!(out, Clear(ClearType::All), MoveTo(0, 0))?;
     for l in lines {
-        execute!(out, Print(l), Print("\n"))?;
+        // raw mode では LF だけでは列が戻らないため、CR も出力する。
+        execute!(out, Print(l), Print("\r\n"))?;
     }
     out.flush()
 }
@@ -62,6 +63,32 @@ fn render_frame<F: std::io::Write>(out: &mut F, lines: &[String]) -> std::io::Re
 mod tests {
     use super::render_frame;
     use crate::parsers::{format_lines, Battery, ChargingState, MemInfo};
+
+    #[test]
+    fn render_frame_aligns_rows_to_left_edge_in_raw_mode() {
+        let lines = format_lines(&None, &Battery::Absent);
+        let mut buf = Vec::new();
+        render_frame(&mut buf, &lines).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        let body = output.strip_prefix("\x1b[2J\x1b[1;1H").unwrap();
+
+        // raw mode では LF は行だけを進め、CR が列を左端へ戻す。
+        let (mut row, mut column) = (0, 0);
+        let mut starts = Vec::new();
+        for ch in body.chars() {
+            match ch {
+                '\r' => column = 0,
+                '\n' => row += 1,
+                _ => {
+                    if starts.len() == row {
+                        starts.push((row, column));
+                    }
+                    column += 1;
+                }
+            }
+        }
+        assert_eq!(starts, vec![(0, 0), (1, 0), (2, 0)]);
+    }
 
     #[test]
     fn render_frame_clears_and_resets_to_origin_before_printing() {
