@@ -28,67 +28,44 @@ impl Lcg {
 /// 各メモリカウンタ（ページ数）を保持する構造体。
 #[derive(Debug, PartialEq, Eq)]
 pub struct VmStat {
+    /// 空きページ数。
     pub free: u64,
+    /// inactiveページ数。
     pub inactive: u64,
+    /// speculativeページ数。
     pub speculative: u64,
+    /// purgeableページ数。
     pub purgeable: u64,
 }
 
 /// 充電状態。
 #[derive(Debug, PartialEq, Eq)]
 pub enum ChargingState {
+    /// 充電中。
     Charging,
+    /// バッテリー駆動で放電中。
     Discharging,
+    /// 満充電、または外部電源接続中。
     Charged,
 }
 
 /// バッテリー状態。`Percent` と `state` を保持するか `Absent`。
 #[derive(Debug, PartialEq, Eq)]
 pub enum Battery {
+    /// バッテリーが存在し、残量と充電状態を保持する。
     Present { percent: u8, state: ChargingState },
+    /// バッテリー情報を取得できない、またはバッテリーが存在しない。
     Absent,
-}
-
-/// リンクから `present: false` を判定する。`false` を含む行は `false`、
-/// それ以外は `true`（= 接続中・存在する）を返す。
-pub fn split_present(line: &str) -> bool {
-    !line.contains("present: false")
-}
-
-/// `pmset -g batt` の 1 行から `Battery` を抽出する。
-/// `present == false` の行は `None`。`%` の直数字列を `u8` として取り、
-/// `discharging` / `charging` / 該当しない場合 `Charged` を返す。
-pub fn parse_battery_line(line: &str, present: bool) -> Option<Battery> {
-    if !present {
-        return None;
-    }
-    // `%` の直前の数字列を取り出す（タブ区切りや id 数字を除外）。
-    let before = line.split('%').next()?;
-    let percent: u8 = before
-        .chars()
-        .rev()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>()
-        .parse()
-        .ok()?;
-    let state = if line.contains("discharging") {
-        ChargingState::Discharging
-    } else if line.contains("charging") {
-        ChargingState::Charging
-    } else {
-        ChargingState::Charged
-    };
-    Some(Battery::Present { percent, state })
 }
 
 /// 使用済みメモリの情報。10進 GB 単位。
 #[derive(Debug, PartialEq)]
 pub struct MemInfo {
+    /// 使用済みメモリ（10進GB）。
     pub used_gb: f64,
+    /// 物理メモリ総量（10進GB）。
     pub total_gb: f64,
+    /// 使用率（0から100の整数パーセント）。
     pub percent: i32,
 }
 
@@ -215,11 +192,13 @@ mod tests {
     use super::*;
 
     #[test]
+    /// `Pages free:` 行からページ数を読み取る。
     fn parses_pages_free() {
         assert_eq!(parse_pages("Pages free:     152673"), Some(152673));
     }
 
     #[test]
+    /// 対象外行、非数値、コロンなしを安全に扱う。
     fn parse_pages_missing_is_none() {
         assert_eq!(parse_pages("Pages wired down: 1"), Some(1));
         assert_eq!(parse_pages("Pages free: notanumber"), None);
@@ -227,6 +206,7 @@ mod tests {
     }
 
     #[test]
+    /// vm_statの4種類のページカウンタをまとめて解析する。
     fn parses_full_vm_stat() {
         let s = "Page size of 16384 bytes\n\
                  Pages free:     152673\n\
@@ -242,11 +222,13 @@ mod tests {
     }
 
     #[test]
+    /// 必須カウンタが不足したvm_stat入力をエラーにする。
     fn parse_vm_stat_missing_is_err() {
         assert!(parse_vm_stat("garbage\n").is_err());
     }
 
     #[test]
+    /// 実機出力にある数値末尾のピリオドを許容する。
     fn parse_vm_stat_trailing_dot_ok() {
         // 実機の vm_stat は値末尾に「.」を含める
         let raw = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
@@ -263,6 +245,7 @@ mod tests {
     }
 
     #[test]
+    /// 任意の生成文字列に対してページ解析がpanicしない。
     fn fuzz_parse_pages_never_panic() {
         let mut r = Lcg::new(0x51ed);
         for _ in 0..5000 {
@@ -273,6 +256,7 @@ mod tests {
     }
 
     #[test]
+    /// 任意の生成文字列に対してvm_stat解析がpanicしない。
     fn fuzz_parse_vm_stat_never_panic() {
         let mut r = Lcg::new(0xF00DBA);
         for _ in 0..5000 {
@@ -283,17 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn fuzz_parse_battery_line_never_panic() {
-        let mut r = Lcg::new(0xB41);
-        for _ in 0..5000 {
-            let n = (r.next() % 48) as usize;
-            let s = r.str_n(n);
-            let _ = parse_battery_line(&s, true);
-            let _ = parse_battery_line(&s, false);
-        }
-    }
-
-    #[test]
+    /// 任意のカウンタ値でも、成功時のメモリ計算結果の範囲不変条件を守る。
     fn fuzz_compute_memory_bounds() {
         let mut r = Lcg::new(0xD2);
         for _ in 0..5000 {
@@ -319,6 +293,7 @@ mod tests {
     }
 
     #[test]
+    /// 欠損を含む任意の表示入力でも3行固定の出力を返す。
     fn fuzz_format_lines_three_lines_never_panic() {
         let mut r = Lcg::new(0xF4);
         for _ in 0..5000 {
@@ -346,73 +321,11 @@ mod tests {
 }
 
 #[cfg(test)]
-mod bt {
-    use super::*;
-    const L: &str =
-        " -InternalBattery-0 (id=22478947) 83%; discharging; 17:55 remaining present: true";
-
-    #[test]
-    fn discharging() {
-        match parse_battery_line(L, true) {
-            Some(Battery::Present { percent, state }) => {
-                assert_eq!(percent, 83);
-                assert!(matches!(state, ChargingState::Discharging));
-            }
-            _ => panic!("expected present discharging"),
-        }
-    }
-
-    #[test]
-    fn absent_when_present_false() {
-        let l = " -InternalBattery-0 (id=1) 100%; charged; present: false";
-        assert_eq!(parse_battery_line(l, false), None);
-    }
-
-    #[test]
-    fn battery_with_tab_and_id_number() {
-        // 実機の pmset はタブ区切りで id 数字を % より前に含む
-        let l = " -InternalBattery-0 (id=22478947)\t81%; discharging; 1:42 remaining present: true";
-        match parse_battery_line(l, true) {
-            Some(Battery::Present { percent, state }) => {
-                assert_eq!(percent, 81);
-                assert!(matches!(state, ChargingState::Discharging));
-            }
-            _ => panic!("expected present discharging"),
-        }
-    }
-
-    #[test]
-    fn charging_keyword() {
-        let l = " -InternalBattery-0 40%; charging; present: true";
-        let b = parse_battery_line(l, true).unwrap();
-        assert!(matches!(
-            b,
-            Battery::Present {
-                state: ChargingState::Charging,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn charged_fallback() {
-        let l = " -InternalBattery-0 100%; 5:00 remaining present: true";
-        let b = parse_battery_line(l, true).unwrap();
-        assert!(matches!(
-            b,
-            Battery::Present {
-                state: ChargingState::Charged,
-                ..
-            }
-        ));
-    }
-}
-
-#[cfg(test)]
 mod mem {
     use super::*;
 
     #[test]
+    /// 通常のページカウンタからGB値と使用率を計算する。
     fn computes_used_gb_and_percent() {
         // 総ページ=2097152, psize=16384
         let vm = VmStat {
@@ -428,6 +341,7 @@ mod mem {
     }
 
     #[test]
+    /// 解放済みページが総ページを超える入力をエラーにする。
     fn total_less_than_freed_is_err() {
         let vm = VmStat {
             free: 999999999,
@@ -444,6 +358,7 @@ mod fmt {
     use super::*;
 
     #[test]
+    /// 実際のメモリ値とバッテリー値を既定の3行表示へ整形する。
     fn renders_present_battery() {
         let m = MemInfo {
             used_gb: 29.80,
@@ -462,6 +377,7 @@ mod fmt {
     }
 
     #[test]
+    /// メモリ欠損を`?`として表示し、行数とラベル位置を維持する。
     fn renders_memory_missing_as_question() {
         let b = Battery::Present {
             percent: 83,
@@ -474,6 +390,7 @@ mod fmt {
     }
 
     #[test]
+    /// バッテリー不在を`n/a`として表示する。
     fn renders_battery_absent_as_na() {
         let m = MemInfo {
             used_gb: 1.0,
@@ -488,6 +405,7 @@ mod fmt {
     }
 
     #[test]
+    /// メモリ・バッテリーがともに存在する場合のwindow titleを整形する。
     fn present() {
         let m = MemInfo {
             used_gb: 29.80,
@@ -505,6 +423,7 @@ mod fmt {
     }
 
     #[test]
+    /// メモリ欠損時もバッテリー部分を保持したwindow titleを整形する。
     fn memory_missing() {
         let b = Battery::Present {
             percent: 83,
@@ -517,6 +436,7 @@ mod fmt {
     }
 
     #[test]
+    /// バッテリー不在時もメモリ部分を保持したwindow titleを整形する。
     fn battery_absent() {
         let m = MemInfo {
             used_gb: 29.80,

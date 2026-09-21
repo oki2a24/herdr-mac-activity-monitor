@@ -1,5 +1,5 @@
-/// メモリ使用量の I/O 層。`sysctl` / `vm_stat` を呼出、
-/// 純粋な解析・計算 (`crate::parsers`) で `MemInfo` を返す。
+//! メモリ使用量の I/O 層。`sysctl` / `vm_stat` を呼出、
+//! 純粋な解析・計算 (`crate::parsers`) で `MemInfo` を返す。
 use std::process::Command;
 
 use crate::parsers::{compute_memory, parse_vm_stat};

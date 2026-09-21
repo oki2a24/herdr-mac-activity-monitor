@@ -89,30 +89,35 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    /// ソケットが消えた場合は失敗回数に関係なく終了する。
     fn exits_when_socket_gone() {
         assert!(should_exit(0, 5, false));
         assert!(should_exit(3, 5, false));
     }
 
     #[test]
+    /// ソケットがあり、失敗回数が閾値以下なら継続する。
     fn continues_when_socket_present_and_under_threshold() {
         assert!(!should_exit(0, 5, true));
         assert!(!should_exit(5, 5, true));
     }
 
     #[test]
+    /// ソケットがあり、失敗回数が閾値を超えた場合は終了する。
     fn exits_when_socket_present_and_over_threshold() {
         assert!(should_exit(6, 5, true));
         assert!(should_exit(100, 5, true));
     }
 
     #[test]
+    /// 現在のプロセスIDを生存中として検出する。
     fn current_process_alive() {
         let pid = std::process::id();
         assert!(is_pid_alive(pid));
     }
 
     #[test]
+    /// PID 0を実プロセスの生存確認対象にせずfalseとする。
     fn dead_pid_not_alive() {
         // 非常に高確率で未使用の pid。確実に死んだ pid は取得できないため
         // `kill -0` の挙動（no such process）を信じて false を期待する。
@@ -120,6 +125,7 @@ mod tests {
     }
 
     #[test]
+    /// 状態ディレクトリ未設定時はロックなしで起動を許可する。
     fn unsets_env_returns_true() {
         let _g = ENV_LOCK.lock().unwrap();
         env::remove_var("HERDR_PLUGIN_STATE_DIR");
@@ -127,6 +133,7 @@ mod tests {
     }
 
     #[test]
+    /// PIDファイルがない場合は現在のPIDでロックを作成する。
     fn acquires_when_no_existing_pid() {
         use std::env::temp_dir;
         let _g = ENV_LOCK.lock().unwrap();
@@ -141,6 +148,7 @@ mod tests {
     }
 
     #[test]
+    /// 生存中のPIDが記録されたロックは二重起動を拒否する。
     fn blocks_when_live_pid_present() {
         use std::env::temp_dir;
         let _g = ENV_LOCK.lock().unwrap();
