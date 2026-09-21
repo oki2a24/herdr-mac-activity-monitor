@@ -53,6 +53,7 @@ pub fn clear_window_title() -> Result<(), String> {
 mod tests {
     use super::*;
     #[test]
+    /// window_title.setリクエストがJSON-RPCの必須項目を含む。
     fn set_request_shape() {
         let s = set_request("abc");
         assert!(s.contains("client.window_title.set"));
@@ -62,6 +63,7 @@ mod tests {
     }
 
     #[test]
+    /// window_title.clearリクエストが空paramsで生成される。
     fn clear_request_shape() {
         let s = clear_request();
         assert!(s.contains("client.window_title.clear"));
@@ -70,6 +72,7 @@ mod tests {
     }
 
     #[test]
+    /// タイトル中の特殊文字をエスケープし、1行のJSONを維持する。
     fn set_request_escapes_special_chars_single_line() {
         let s = set_request("a\"b\\c\nd");
         assert!(!s.contains('\n'));
@@ -80,6 +83,7 @@ mod tests {
 
     #[test]
     #[allow(unsafe_code, deprecated)]
+    /// ソケットパス未設定時のタイトル更新をエラーにする。
     fn set_window_title_unset_env_is_err() {
         unsafe {
             std::env::remove_var("HERDR_SOCKET_PATH");
@@ -89,6 +93,7 @@ mod tests {
 
     #[test]
     #[allow(unsafe_code, deprecated)]
+    /// ソケットパス未設定時のタイトル消去をエラーにする。
     fn clear_window_title_unset_env_is_err() {
         unsafe {
             std::env::remove_var("HERDR_SOCKET_PATH");

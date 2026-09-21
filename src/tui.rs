@@ -1,5 +1,5 @@
-/// 3 秒ごとにメモリ・バッテリーを更新して表示する生 TUI（crossterm）。
-/// `q` / `Esc` で終了。
+//! 3 秒ごとにメモリ・バッテリーを更新して表示する生 TUI（crossterm）。
+//! `q` / `Esc` で終了。
 use std::time::Duration;
 
 use crossterm::{
@@ -13,7 +13,7 @@ use crossterm::{
     },
 };
 
-use crate::{battery, memory, parsers::MemInfo};
+use crate::{memory, metrics::PopupState};
 
 /// 生モード・別画面を有効にし、ループを走り、退出時にクリーンアップする。
 pub fn run() -> std::io::Result<()> {
@@ -30,10 +30,11 @@ pub fn run() -> std::io::Result<()> {
 /// `q` / `Esc` でループから抜ける。
 fn run_loop<F: std::io::Write>(out: &mut F) -> std::io::Result<()> {
     let tick = Duration::from_secs(3);
+    let mut popup = PopupState::new();
     loop {
-        let mem: Option<MemInfo> = memory::get().ok();
-        let batt = battery::get();
-        render_frame(out, &crate::parsers::format_lines(&mem, &batt))?;
+        let mem = memory::get().ok();
+        let snapshot = popup.collect(mem);
+        render_frame(out, &crate::metrics::format_popup_lines(&snapshot))?;
         // 入力待ち 3 秒。入力があれば読み取り、キーなら q/Esc で抜ける、
         // 別のイベントなら継続。タイムアウトなら次の 3 秒で再更新。
         if let Ok(true) = event::poll(tick) {
@@ -65,6 +66,7 @@ mod tests {
     use crate::parsers::{format_lines, Battery, ChargingState, MemInfo};
 
     #[test]
+    /// raw modeで各行の先頭が左端に揃うようCRLFを出力する。
     fn render_frame_aligns_rows_to_left_edge_in_raw_mode() {
         let lines = format_lines(&None, &Battery::Absent);
         let mut buf = Vec::new();
@@ -91,6 +93,7 @@ mod tests {
     }
 
     #[test]
+    /// 描画前に画面全体を消去し、カーソルを原点へ戻す。
     fn render_frame_clears_and_resets_to_origin_before_printing() {
         let lines = format_lines(
             &Some(MemInfo {
