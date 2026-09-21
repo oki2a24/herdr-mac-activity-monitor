@@ -93,16 +93,21 @@ pub fn scan_top_three(cancel: Option<&AtomicBool>) -> Vec<ProcessMemory> {
 }
 
 fn get_process_footprint(pid: u32, cancel: Option<&AtomicBool>, deadline: Instant) -> Option<u64> {
-    let child = Command::new("footprint")
+    let mut command = Command::new("footprint");
+    command
         .args(["-p", &pid.to_string()])
-        .stdout(Stdio::piped())
-        .spawn()
-        .ok()?;
+        .stdout(Stdio::piped());
+    let child = spawn_with_suppressed_stderr(command)?;
     let (status, stdout) = wait_for_child(child, deadline, cancel)?;
     if !status.success() {
         return None;
     }
     parse_phys_footprint(&String::from_utf8_lossy(&stdout))
+}
+
+/// 子プロセスの診断を親のpopup端末へ継承せずに起動する。
+fn spawn_with_suppressed_stderr(mut command: Command) -> Option<Child> {
+    command.stderr(Stdio::null()).spawn().ok()
 }
 
 fn wait_for_child(
@@ -180,6 +185,7 @@ fn set_nonblocking(fd: i32) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     /// footprint出力からphysical footprintの数値を取り出す。
@@ -214,5 +220,36 @@ mod tests {
     /// プロセスが入れ替わって空の結果になってもpanicしない。
     fn process_churn_can_produce_empty_result_without_panicking() {
         assert!(top_three(Vec::new()).is_empty());
+    }
+
+    #[test]
+    /// 子プロセスの診断をpopupの標準エラーへ漏らさない。
+    fn child_diagnostics_do_not_escape_popup() {
+        const CHILD_ENV: &str = "HERDR_ACTIVITY_MONITOR_STDERR_CHILD";
+        const DIAGNOSTIC: &str = "herdr-test-child-diagnostic";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "printf herdr-test-child-diagnostic >&2"]);
+            let mut child = spawn_with_suppressed_stderr(command).expect("child must start");
+            assert!(child.wait().expect("child must finish").success());
+            return;
+        }
+
+        let output = Command::new(std::env::current_exe().expect("test binary path"))
+            .args([
+                "--exact",
+                "processes::tests::child_diagnostics_do_not_escape_popup",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("child test must run");
+
+        assert!(output.status.success(), "child test failed: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains(DIAGNOSTIC),
+            "child diagnostics must not reach the popup: {stderr}"
+        );
     }
 }
