@@ -27,7 +27,16 @@ pub(crate) fn parse_phys_footprint(output: &str) -> Option<u64> {
         if label.trim() != "phys_footprint" {
             return None;
         }
-        value.trim().replace(',', "").parse().ok()
+        let value = value.trim().replace(',', "");
+        let mut parts = value.split_whitespace();
+        let amount = parts.next()?.parse::<u64>().ok()?;
+        match parts.next() {
+            None | Some("B") => Some(amount),
+            Some("KB") => amount.checked_mul(1024),
+            Some("MB") => amount.checked_mul(1024 * 1024),
+            Some("GB") => amount.checked_mul(1024 * 1024 * 1024),
+            Some(_) => None,
+        }
     })
 }
 
@@ -193,6 +202,15 @@ mod tests {
         assert_eq!(
             parse_phys_footprint("pid: 42\nphys_footprint: 1,234,567\n"),
             Some(1_234_567)
+        );
+    }
+
+    #[test]
+    /// macOSのfootprintが出力する単位付きphysical footprintをバイト数へ変換する。
+    fn parses_physical_footprint_with_macos_unit() {
+        assert_eq!(
+            parse_phys_footprint("phys_footprint: 1,712 KB\n"),
+            Some(1_753_088)
         );
     }
 
