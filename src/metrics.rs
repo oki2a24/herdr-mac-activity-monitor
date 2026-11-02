@@ -1,4 +1,4 @@
-//! popup専用の詳細metric取得・状態表現・表示整形。
+//! ポップアップ専用の詳細情報の取得、状態表現、表示整形。
 
 use std::{
     sync::{
@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use crate::{battery, parsers::MemInfo, processes::ProcessMemory};
+use crate::{battery, parsers::MemInfo, processes::MemoryConsumer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// macOS のメモリプレッシャー通知を表示用の状態へ変換したもの。
@@ -59,7 +59,7 @@ pub struct SwapUsage {
 }
 
 #[derive(Debug)]
-/// popupの1回分の表示データ。
+/// ポップアップ1回分の表示データ。
 pub struct PopupSnapshot {
     /// 既存のメモリ使用量。取得失敗時はNone。
     pub memory: Option<MemInfo>,
@@ -67,8 +67,8 @@ pub struct PopupSnapshot {
     pub pressure: MemoryPressure,
     /// swap使用量。取得失敗時はNone。
     pub swap: Option<SwapUsage>,
-    /// physical footprintの大きい上位プロセス。
-    pub processes: Vec<ProcessMemory>,
+    /// アプリ単位に合算したphysical footprint（物理メモリ使用量）の上位項目。
+    pub processes: Vec<MemoryConsumer>,
     /// CPU使用率。
     pub cpu: CpuUtilization,
     /// 熱状態。
@@ -79,7 +79,7 @@ pub struct PopupSnapshot {
     pub runtime: battery::RuntimeEstimate,
 }
 
-/// popup更新のために、前回との差分が必要なcollectorを保持する状態。
+/// ポップアップ更新に必要な、前回との差分や取得器を保持する状態。
 pub struct PopupState {
     pressure: MemoryPressureMonitor,
     cpu: CpuSampler,
@@ -87,7 +87,7 @@ pub struct PopupState {
 }
 
 impl PopupState {
-    /// 各collectorを初期化する。
+    /// 各情報収集器を初期化する。
     pub fn new() -> Self {
         Self {
             pressure: MemoryPressureMonitor::new(),
@@ -96,7 +96,7 @@ impl PopupState {
         }
     }
 
-    /// 渡されたメモリ値とmacOSの詳細metricをまとめて1スナップショットにする。
+    /// 渡されたメモリ値とmacOSの詳細情報をまとめて1回分の状態にする。
     pub fn collect(&mut self, memory: Option<MemInfo>) -> PopupSnapshot {
         let power = battery::get_snapshot();
         PopupSnapshot {
@@ -114,10 +114,10 @@ impl PopupState {
 
 struct ProcessScanner {
     request: Option<Sender<()>>,
-    results: Receiver<Vec<ProcessMemory>>,
+    results: Receiver<Option<Vec<MemoryConsumer>>>,
     cancel: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
-    latest: Vec<ProcessMemory>,
+    latest: Vec<MemoryConsumer>,
     in_flight: bool,
 }
 
@@ -127,7 +127,7 @@ impl ProcessScanner {
         let (results, result_receiver) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(true));
         let worker_cancel = Arc::clone(&cancel);
-        // footprintはPIDごとの外部コマンド呼び出しで遅くなり得るため、
+        // 全processのfootprint snapshotは時間がかかるため、
         // TUIの描画スレッドとは分離してpopupの入力応答を止めない。
         let worker = thread::spawn(move || {
             while requests.recv().is_ok() {
@@ -150,12 +150,12 @@ impl ProcessScanner {
         }
     }
 
-    fn collect(&mut self) -> Vec<ProcessMemory> {
-        let mut completed = false;
+    fn collect(&mut self) -> Vec<MemoryConsumer> {
         while let Ok(result) = self.results.try_recv() {
-            self.latest = result;
+            if let Some(result) = result {
+                self.latest = result;
+            }
             self.in_flight = false;
-            completed = true;
         }
         if !self.in_flight {
             if let Some(request) = &self.request {
@@ -164,13 +164,8 @@ impl ProcessScanner {
                 }
             }
         }
-        if completed {
-            self.latest.clone()
-        } else {
-            // 実行中のscan結果を前回値として表示すると、現在のプロセス一覧と
-            // 誤認されるため、完了するまでは明示的にunavailableとする。
-            Vec::new()
-        }
+        // snapshotを取得中も直近の完了値を表示し、一覧が一時的に消えるのを防ぐ。
+        self.latest.clone()
     }
 }
 
@@ -694,7 +689,27 @@ fn truncate_name(name: &str, max_chars: usize) -> String {
     }
 }
 
-/// popupの表示行を固定順で生成する。
+fn truncate_consumer_name(name: &str, max_chars: usize) -> String {
+    let Some((process_name, pid_suffix)) = name.rsplit_once(" (PID ") else {
+        return truncate_name(name, max_chars);
+    };
+    let Some(pid) = pid_suffix
+        .strip_suffix(')')
+        .and_then(|pid| pid.parse::<u32>().ok())
+    else {
+        return truncate_name(name, max_chars);
+    };
+
+    let suffix = format!(" (PID {pid})");
+    let process_name_limit = max_chars.saturating_sub(suffix.chars().count() + 1);
+    format!(
+        "{}{}",
+        truncate_name(process_name, process_name_limit),
+        suffix
+    )
+}
+
+/// ポップアップの表示行を固定順で生成する。
 pub fn format_popup_lines(snapshot: &PopupSnapshot) -> Vec<String> {
     let existing = crate::parsers::format_lines(&snapshot.memory, &snapshot.battery);
     let mut lines = vec![existing[0].clone(), existing[1].clone()];
@@ -711,16 +726,21 @@ pub fn format_popup_lines(snapshot: &PopupSnapshot) -> Vec<String> {
         None => lines.push("Swap             unavailable".to_string()),
     }
     lines.push(String::new());
-    lines.push("Top 3 Available Processes (physical footprint)".to_string());
+    lines.push("Top 3 Memory Consumers (apps grouped)".to_string());
     if snapshot.processes.is_empty() {
         lines.push("  unavailable".to_string());
     } else {
-        for process in &snapshot.processes {
+        for consumer in &snapshot.processes {
+            let process_count = if consumer.process_count > 1 {
+                format!(" ({} processes)", consumer.process_count)
+            } else {
+                String::new()
+            };
             lines.push(format!(
-                "  {:<32} PID {:>6} {}",
-                truncate_name(&process.name, 32),
-                process.pid,
-                format_bytes(process.bytes)
+                "  {} — {}{}",
+                truncate_consumer_name(&consumer.name, 32),
+                format_bytes(consumer.bytes),
+                process_count
             ));
         }
     }
@@ -756,10 +776,10 @@ mod tests {
                 used_bytes: 1_000_000_000,
                 total_bytes: 2_000_000_000,
             }),
-            processes: vec![ProcessMemory {
-                pid: 42,
+            processes: vec![MemoryConsumer {
                 name: "local-llm".to_string(),
                 bytes: 3_000_000_000,
+                process_count: 1,
             }],
             cpu: CpuUtilization::Percent(12.34),
             thermal: ThermalState::Serious,
@@ -773,6 +793,7 @@ mod tests {
 
     #[test]
     /// CPUカウンタが同値、または逆行した場合は有効な使用率を返さない。
+    // why: 無効な差分から誤ったCPU使用率を作らないため。
     fn cpu_delta_is_unavailable_for_invalid_or_empty_delta() {
         let ticks = CpuTicks {
             busy: 10,
@@ -786,7 +807,8 @@ mod tests {
     }
 
     #[test]
-    /// busy deltaをtotal deltaで割った値をCPU使用率として返す。
+    /// CPU使用時間の差分を合計時間の差分で割り、使用率として返す。
+    // why: CPUカウンタの差分を正しい割合へ変換するため。
     fn cpu_delta_returns_busy_percentage() {
         assert_eq!(
             calculate_cpu_utilization(
@@ -804,7 +826,8 @@ mod tests {
     }
 
     #[test]
-    /// popupが固定セクション順と各metricの明示的な表示値を持つ。
+    /// ポップアップが固定の項目順と各指標の明示的な表示値を持つ。
+    // why: 表示順と取得不能状態の意味が崩れないようにするため。
     fn popup_has_fixed_sections_and_explicit_states() {
         let lines = format_popup_lines(&snapshot());
         assert_eq!(lines[0], "Activity Monitor");
@@ -813,11 +836,73 @@ mod tests {
         assert!(lines.iter().any(|line| line == "CPU              12.3%"));
         assert!(lines.iter().any(|line| line == "Thermal          serious"));
         assert!(lines.iter().any(|line| line == "Battery runtime  1h 02m"));
-        assert!(lines.iter().any(|line| line.contains("PID     42")));
     }
 
     #[test]
-    /// runtime取得失敗を0分と誤表示せず、Unavailableのまま表示する。
+    /// アプリ名と関連プロセスの合計メモリ量を一つの行として表示する。
+    // why: 関連プロセスが別々の項目にならず、アプリ単位で把握できるため。
+    fn popup_displays_application_name_and_aggregate_memory() {
+        let mut value = snapshot();
+        value.processes[0].name = "Google Chrome".to_string();
+        value.processes[0].process_count = 2;
+        let lines = format_popup_lines(&value);
+        let section_title = "Top 3 Memory Consumers (apps grouped)";
+        assert!(lines.iter().any(|line| line == section_title));
+        assert!(lines
+            .iter()
+            .any(|line| line == "  Google Chrome — 3.00 GB (2 processes)"));
+    }
+
+    #[test]
+    /// 更新中も直近に取得した項目一覧を表示し続ける。
+    // why: 更新に時間がかかる間も、表示中の一覧を消さないため。
+    fn process_scanner_retains_latest_snapshot_while_refreshing() {
+        let latest = vec![MemoryConsumer {
+            name: "Safari".to_string(),
+            bytes: 2_000_000_000,
+            process_count: 1,
+        }];
+        let (request, _requests) = mpsc::channel();
+        let (_result_sender, results) = mpsc::channel();
+        let mut scanner = ProcessScanner {
+            request: Some(request),
+            results,
+            cancel: Arc::new(AtomicBool::new(true)),
+            worker: None,
+            latest: latest.clone(),
+            in_flight: true,
+        };
+
+        assert_eq!(scanner.collect(), latest);
+    }
+
+    #[test]
+    /// 取得失敗時に直近の項目一覧を空の結果で上書きしない。
+    // why: 取得失敗を空の正常結果と取り違えないため。
+    fn process_scanner_retains_latest_snapshot_after_failed_refresh() {
+        let latest = vec![MemoryConsumer {
+            name: "Safari".to_string(),
+            bytes: 2_000_000_000,
+            process_count: 1,
+        }];
+        let (request, _requests) = mpsc::channel();
+        let (result_sender, results) = mpsc::channel();
+        result_sender.send(None).unwrap();
+        let mut scanner = ProcessScanner {
+            request: Some(request),
+            results,
+            cancel: Arc::new(AtomicBool::new(true)),
+            worker: None,
+            latest: latest.clone(),
+            in_flight: true,
+        };
+
+        assert_eq!(scanner.collect(), latest);
+    }
+
+    #[test]
+    /// 残り時間の取得失敗を0分と誤表示せず、取得不能のまま表示する。
+    // why: 未取得の残り時間を0分と誤表示しないため。
     fn popup_does_not_turn_unavailable_runtime_into_zero() {
         let mut value = snapshot();
         value.runtime = battery::RuntimeEstimate::Unavailable;
@@ -830,6 +915,7 @@ mod tests {
 
     #[test]
     /// 長すぎるプロセス名を表示幅内へ切り詰める。
+    // why: 長い名前で表示領域や他の情報を押し出さないため。
     fn long_process_names_are_truncated() {
         let mut value = snapshot();
         value.processes[0].name = "a".repeat(64);
@@ -841,8 +927,25 @@ mod tests {
     }
 
     #[test]
+    /// 長いbundle外プロセス名でもPIDを行末に残す。
+    // why: 長い名前を省略してもプロセス識別子を確認できるため。
+    fn long_unbundled_process_names_keep_pid_visible() {
+        let mut value = snapshot();
+        value.processes[0].name = format!("Process · {} (PID 123456)", "a".repeat(64));
+        let lines = format_popup_lines(&value);
+        let row = lines
+            .iter()
+            .find(|line| line.contains("PID 123456"))
+            .expect("process row should keep its PID");
+
+        assert!(row.ends_with("(PID 123456) — 3.00 GB"));
+        assert!(!row.contains(&"a".repeat(64)));
+    }
+
+    #[test]
     #[cfg(target_os = "macos")]
-    /// macOS固有collectorを実機上で呼び出してもpanicしない。
+    /// macOS固有の情報収集器を呼び出してもpanicしない。
+    // why: OS固有の取得処理がpanicせず呼び出せることを確かめるため。
     fn macos_collectors_are_callable_without_panicking() {
         let _ = read_cpu_ticks();
         let _ = get_swap_usage();

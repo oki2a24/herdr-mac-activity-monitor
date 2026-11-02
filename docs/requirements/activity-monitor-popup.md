@@ -128,7 +128,7 @@ macOS自身が意味を定義している状態については表示してよい
 - Memory available
 - Memory Pressure
 - Swap使用量
-- メモリ使用量の多いプロセス
+- メモリ使用量の多いアプリ（関連プロセスを合算した上位3件）
 
 Memory usedだけでは十分ではない。
 
@@ -140,16 +140,17 @@ Memory Pressureは、
 macOS自身が現在のメモリ状況をどのように評価しているかを
 判断する材料になる。
 
-メモリ使用量の多いプロセスを表示することで、
+メモリ使用量の多いアプリを関連プロセスごと合算して表示することで、
 
 > 何がメモリを使用しているのか？
 
 という次の問いを調べる手掛かりを提供する。
 
-プロセスごとのメモリ使用量として
-RSS、physical footprintなどのどの値を採用するか、
-また関連プロセスをまとめて扱うべきかについては、
-Technical Researchで調査する。
+表示値はActivity Monitorとの比較を保つためphysical footprintとする。
+同一`.app` bundleに属するメインプロセスとhelperプロセスを合算し、
+アプリの表示名と合計メモリを上位3件まで表示する。
+アプリbundleに結び付かないsystem / command processは、
+アプリと区別できる名前を付けて表示する。
 
 
 ### Compute / Thermal

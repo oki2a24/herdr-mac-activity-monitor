@@ -3,7 +3,7 @@ use std::os::unix::net::UnixStream;
 
 /// JSON 文字列リテラルとして安全にエスケープする（`"..."` の中身、クォートは付けない）。
 /// バックスラッシュ・ダブルクォート・改行（`\n`, `\r`, `\t`）を `\u00XX` / `\\` / `\"` に変換し、
-/// 結果は newline を含まない（1行）を保証する。
+/// 結果に改行を含めず、1行にする。
 fn json_escape(s: &str) -> String {
     let mut out = String::new();
     for c in s.chars() {
@@ -30,7 +30,7 @@ pub fn clear_request() -> String {
     r#"{"jsonrpc":"2.0","id":"window_title_clear","method":"client.window_title.clear","params":{}}"#.to_string()
 }
 
-/// `HERDR_SOCKET_PATH` の Unix domain socket に `body` を1行送信する。
+/// `HERDR_SOCKET_PATH` の Unixドメインソケットへ `body` を1行送信する。
 /// 環境変数未設定・接続失敗・送信失敗で `Err`、成功で `Ok(())`。
 fn send(body: &str) -> Result<(), String> {
     let path = std::env::var_os("HERDR_SOCKET_PATH")
@@ -54,6 +54,7 @@ mod tests {
     use super::*;
     #[test]
     /// window_title.setリクエストがJSON-RPCの必須項目を含む。
+    // why: JSON-RPC要求に必要な項目が欠けるのを防ぐため。
     fn set_request_shape() {
         let s = set_request("abc");
         assert!(s.contains("client.window_title.set"));
@@ -64,6 +65,7 @@ mod tests {
 
     #[test]
     /// window_title.clearリクエストが空paramsで生成される。
+    // why: 消去要求に不要なパラメータが混ざるのを防ぐため。
     fn clear_request_shape() {
         let s = clear_request();
         assert!(s.contains("client.window_title.clear"));
@@ -73,6 +75,7 @@ mod tests {
 
     #[test]
     /// タイトル中の特殊文字をエスケープし、1行のJSONを維持する。
+    // why: 特殊文字でJSONや1行の通信形式が壊れるのを防ぐため。
     fn set_request_escapes_special_chars_single_line() {
         let s = set_request("a\"b\\c\nd");
         assert!(!s.contains('\n'));
@@ -84,6 +87,7 @@ mod tests {
     #[test]
     #[allow(unsafe_code, deprecated)]
     /// ソケットパス未設定時のタイトル更新をエラーにする。
+    // why: 接続先の設定漏れを成功として扱わないため。
     fn set_window_title_unset_env_is_err() {
         unsafe {
             std::env::remove_var("HERDR_SOCKET_PATH");
@@ -94,6 +98,7 @@ mod tests {
     #[test]
     #[allow(unsafe_code, deprecated)]
     /// ソケットパス未設定時のタイトル消去をエラーにする。
+    // why: 接続先の設定漏れを成功として扱わないため。
     fn clear_window_title_unset_env_is_err() {
         unsafe {
             std::env::remove_var("HERDR_SOCKET_PATH");

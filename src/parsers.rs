@@ -1,4 +1,4 @@
-/// 各テストモジュールで再利用する、std のみ xorshift64 乱数ジェネレータ。
+/// 各テストモジュールで再利用する、標準ライブラリだけを使うxorshift64乱数生成器。
 #[cfg(test)]
 pub(crate) struct Lcg(u64);
 #[cfg(test)]
@@ -120,9 +120,9 @@ pub fn format_lines(m: &Option<MemInfo>, b: &Battery) -> Vec<String> {
     vec!["Activity Monitor".to_string(), mem_line, batt_line]
 }
 
-/// ウィンドウタイトル用の1行文字列を生成する。
+/// ウィンドウタイトル用の1行を生成する。
 /// 形式: "🧠 USED/TOTALGB PERCENT% | 🔋 PERCENT% STATE"。
-/// Memory 欠損は "🧠 n/a"、Battery 欠損は "... | 🔋 n/a"。
+/// メモリ欠損は "🧠 n/a"、バッテリー欠損は "... | 🔋 n/a"。
 pub fn format_window_title(m: &Option<crate::parsers::MemInfo>, b: &Battery) -> String {
     let mem_part = match m {
         Some(x) => format!("{:.2}/{:.2}GB {}%", x.used_gb, x.total_gb, x.percent),
@@ -193,12 +193,14 @@ mod tests {
 
     #[test]
     /// `Pages free:` 行からページ数を読み取る。
+    // why: 空きページ数を実機出力から正しく読み取るため。
     fn parses_pages_free() {
         assert_eq!(parse_pages("Pages free:     152673"), Some(152673));
     }
 
     #[test]
     /// 対象外行、非数値、コロンなしを安全に扱う。
+    // why: 対象外行や不正値をページ数として誤読しないため。
     fn parse_pages_missing_is_none() {
         assert_eq!(parse_pages("Pages wired down: 1"), Some(1));
         assert_eq!(parse_pages("Pages free: notanumber"), None);
@@ -207,6 +209,7 @@ mod tests {
 
     #[test]
     /// vm_statの4種類のページカウンタをまとめて解析する。
+    // why: 必要なページカウンタを一組として読み取るため。
     fn parses_full_vm_stat() {
         let s = "Page size of 16384 bytes\n\
                  Pages free:     152673\n\
@@ -223,12 +226,14 @@ mod tests {
 
     #[test]
     /// 必須カウンタが不足したvm_stat入力をエラーにする。
+    // why: 必要なカウンタの欠落を正常な入力と誤認しないため。
     fn parse_vm_stat_missing_is_err() {
         assert!(parse_vm_stat("garbage\n").is_err());
     }
 
     #[test]
     /// 実機出力にある数値末尾のピリオドを許容する。
+    // why: 実機出力の末尾記号で数値解析が失敗しないため。
     fn parse_vm_stat_trailing_dot_ok() {
         // 実機の vm_stat は値末尾に「.」を含める
         let raw = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
@@ -246,6 +251,7 @@ mod tests {
 
     #[test]
     /// 任意の生成文字列に対してページ解析がpanicしない。
+    // why: 任意の入力文字列でもページ解析がpanicしないため。
     fn fuzz_parse_pages_never_panic() {
         let mut r = Lcg::new(0x51ed);
         for _ in 0..5000 {
@@ -257,6 +263,7 @@ mod tests {
 
     #[test]
     /// 任意の生成文字列に対してvm_stat解析がpanicしない。
+    // why: 任意の入力文字列でもvm_stat解析がpanicしないため。
     fn fuzz_parse_vm_stat_never_panic() {
         let mut r = Lcg::new(0xF00DBA);
         for _ in 0..5000 {
@@ -268,6 +275,7 @@ mod tests {
 
     #[test]
     /// 任意のカウンタ値でも、成功時のメモリ計算結果の範囲不変条件を守る。
+    // why: 任意のカウンタ値でも計算結果の範囲を守るため。
     fn fuzz_compute_memory_bounds() {
         let mut r = Lcg::new(0xD2);
         for _ in 0..5000 {
@@ -294,6 +302,7 @@ mod tests {
 
     #[test]
     /// 欠損を含む任意の表示入力でも3行固定の出力を返す。
+    // why: 欠損を含む入力でも表示整形がpanicせず3行を保つため。
     fn fuzz_format_lines_three_lines_never_panic() {
         let mut r = Lcg::new(0xF4);
         for _ in 0..5000 {
@@ -326,6 +335,7 @@ mod mem {
 
     #[test]
     /// 通常のページカウンタからGB値と使用率を計算する。
+    // why: 通常の入力から使用量と使用率を正しく計算するため。
     fn computes_used_gb_and_percent() {
         // 総ページ=2097152, psize=16384
         let vm = VmStat {
@@ -342,6 +352,7 @@ mod mem {
 
     #[test]
     /// 解放済みページが総ページを超える入力をエラーにする。
+    // why: 総量を超える解放ページを負の使用量として通さないため。
     fn total_less_than_freed_is_err() {
         let vm = VmStat {
             free: 999999999,
@@ -359,6 +370,7 @@ mod fmt {
 
     #[test]
     /// 実際のメモリ値とバッテリー値を既定の3行表示へ整形する。
+    // why: 有効なメモリとバッテリー状態を所定の形式で表示するため。
     fn renders_present_battery() {
         let m = MemInfo {
             used_gb: 29.80,
@@ -378,6 +390,7 @@ mod fmt {
 
     #[test]
     /// メモリ欠損を`?`として表示し、行数とラベル位置を維持する。
+    // why: メモリ欠損を明示し、行構成を崩さないため。
     fn renders_memory_missing_as_question() {
         let b = Battery::Present {
             percent: 83,
@@ -391,6 +404,7 @@ mod fmt {
 
     #[test]
     /// バッテリー不在を`n/a`として表示する。
+    // why: バッテリー不在を明示し、行構成を崩さないため。
     fn renders_battery_absent_as_na() {
         let m = MemInfo {
             used_gb: 1.0,
@@ -405,7 +419,8 @@ mod fmt {
     }
 
     #[test]
-    /// メモリ・バッテリーがともに存在する場合のwindow titleを整形する。
+    /// メモリとバッテリーがともにある場合のウィンドウタイトルを整形する。
+    // why: 両方の状態がある場合のウィンドウタイトル形式を保つため。
     fn present() {
         let m = MemInfo {
             used_gb: 29.80,
@@ -423,7 +438,8 @@ mod fmt {
     }
 
     #[test]
-    /// メモリ欠損時もバッテリー部分を保持したwindow titleを整形する。
+    /// メモリが欠けてもバッテリー情報を残したウィンドウタイトルを整形する。
+    // why: メモリ欠損時にもバッテリー情報を残すため。
     fn memory_missing() {
         let b = Battery::Present {
             percent: 83,
@@ -436,7 +452,8 @@ mod fmt {
     }
 
     #[test]
-    /// バッテリー不在時もメモリ部分を保持したwindow titleを整形する。
+    /// バッテリーがなくてもメモリ情報を残したウィンドウタイトルを整形する。
+    // why: バッテリー不在時にもメモリ情報を残すため。
     fn battery_absent() {
         let m = MemInfo {
             used_gb: 29.80,

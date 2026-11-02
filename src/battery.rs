@@ -1,11 +1,11 @@
-//! バッテリー状態の I/O 層。macOS の IOPowerSources を呼出す。
+//! バッテリー状態の入出力層。macOS の IOPowerSources を呼び出す。
 //!
-//! window titleで使う既存の `Battery` 型への変換と、popup専用の
-//! estimated runtimeを同じraw snapshotから行う。pmsetへのfallbackは持たない。
+//! ウィンドウタイトルで使う既存の `Battery` 型への変換と、ポップアップ専用の
+//! 推定残り時間の取得を同じ情報から行う。pmsetによる代替取得は行わない。
 use crate::parsers::{Battery, ChargingState};
 
 #[derive(Debug, PartialEq, Eq)]
-/// IOPowerSources が返す、バッテリー残り時間の意味を表す。
+/// IOPowerSources が返す、バッテリー残り時間の状態を表す。
 pub enum RuntimeEstimate {
     /// 残り時間を秒で表す。値は 0 秒以上に正規化される。
     Seconds(u64),
@@ -18,11 +18,11 @@ pub enum RuntimeEstimate {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-/// 1回の IOPowerSources 読み取り結果。
+/// IOPowerSources から1回で取得した電源情報。
 pub struct PowerSnapshot {
-    /// 既存の window title 表示と共有するバッテリー状態。
+    /// 既存のウィンドウタイトル表示と共有するバッテリー状態。
     pub battery: Battery,
-    /// popup に表示する残り時間の状態。
+    /// ポップアップに表示する残り時間の状態。
     pub runtime: RuntimeEstimate,
 }
 
@@ -42,7 +42,7 @@ pub fn get_snapshot() -> PowerSnapshot {
     }
 }
 
-/// 既存watch経路向けのBattery取得。表示契約は変更しない。
+/// 既存の監視経路向けにバッテリー状態を取得する。表示形式は変えない。
 pub fn get() -> Battery {
     #[cfg(target_os = "macos")]
     {
@@ -292,7 +292,8 @@ mod tests {
     use super::*;
 
     #[test]
-    /// macOS以外では、電源情報を取得できないことをUnavailableで表す。
+    /// macOS以外では、電源情報を取得できない状態として表す。
+    // why: macOS以外で取得できない状態を、正常値やゼロと誤認しないため。
     fn non_macos_fallback_is_unavailable() {
         #[cfg(not(target_os = "macos"))]
         assert_eq!(get_snapshot().runtime, RuntimeEstimate::Unavailable);
@@ -300,13 +301,15 @@ mod tests {
 
     #[test]
     /// IOPowerSourcesのUnknown/Unlimitedを残り0秒へ潰さない。
+    // why: 推定不能と時間制限なしを、残り0秒と取り違えないため。
     fn runtime_states_are_not_collapsed_to_zero() {
         assert_ne!(RuntimeEstimate::Unknown, RuntimeEstimate::Seconds(0));
         assert_ne!(RuntimeEstimate::Unlimited, RuntimeEstimate::Seconds(0));
     }
 
     #[test]
-    /// pmsetのテキスト解析ではなく、電源源フィールドの組み合わせを状態へ変換する。
+    /// pmsetのテキスト解析に頼らず、電源情報の各項目から状態を決める。
+    // why: 外部コマンドの文章に依存せず、電源情報から状態を決めるため。
     fn maps_power_source_state_without_pmset_text() {
         assert_eq!(
             map_charging_state(true, false, true),
@@ -327,7 +330,8 @@ mod tests {
     }
 
     #[test]
-    /// IOPowerSourcesの生フィールドを既存のBattery表示契約へ変換する。
+    /// IOPowerSourcesの各項目を既存のバッテリー表示形式へ変換する。
+    // why: 新しい取得元でも、既存のバッテリー表示契約を保つため。
     fn converts_power_source_fields_to_existing_battery_contract() {
         assert_eq!(
             battery_from_fields(81, false, false, true),
@@ -348,7 +352,8 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
-    /// macOS固有の残り時間センチネル値と秒数をモデル化する。
+    /// macOS固有の残り時間を示す特別な値と秒数を状態へ変換する。
+    // why: OSの特別な値を通常の残り時間と区別するため。
     fn maps_iopower_sources_runtime_sentinels() {
         assert_eq!(runtime_from_seconds(-1.0), RuntimeEstimate::Unknown);
         assert_eq!(runtime_from_seconds(-2.0), RuntimeEstimate::Unlimited);
@@ -357,7 +362,8 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
-    /// 実機のIOPowerSources読み取りが全てのruntime状態を安全に返すことを確認する。
+    /// 実機のIOPowerSources読み取りが全ての残り時間の状態を安全に返すことを確認する。
+    // why: 実際のOS情報取得が安全に完了することを確かめるため。
     fn iopower_sources_snapshot_is_safe_to_read() {
         let snapshot = get_snapshot();
         assert!(matches!(

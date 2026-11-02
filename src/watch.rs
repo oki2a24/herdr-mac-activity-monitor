@@ -1,5 +1,5 @@
-//! window title 常時更新の watch デーモン。
-//! タイトル操作に集中し、`memory` / `battery` / `parsers` / `herdr` を再利用する。
+//! ウィンドウタイトルを常時更新する監視プロセス。
+//! タイトル操作に集中し、`memory` / `battery` / `parsers` / `herdr`を再利用する。
 use std::fs;
 
 /// 接続断（サーバ停止）または連続失敗閾値超過で終了判定する。
@@ -26,7 +26,7 @@ pub fn is_pid_alive(pid: u32) -> bool {
     status.unwrap_or(false)
 }
 
-/// watch デーモンの排他ロックを取得する。
+/// 監視プロセスの排他ロックを取得する。
 /// `HERDR_PLUGIN_STATE_DIR` が未設定なら、`true` を返してガードなしで動作する。
 /// 設定されていれば `<state_dir>/watch.pid` を操作して排他制御を行う。
 pub fn acquire_watch_lock() -> bool {
@@ -48,7 +48,7 @@ pub fn acquire_watch_lock() -> bool {
     }
 }
 
-/// watch デーモン本体。pid ロックを取得できなければ即 return。
+/// 監視プロセス本体。PIDロックを取得できなければすぐに終了する。
 /// 以降は 3 秒周期で タイトルを更新し、接続断または連続失敗で終了する。
 pub fn run() -> std::io::Result<()> {
     use std::thread;
@@ -90,6 +90,7 @@ mod tests {
 
     #[test]
     /// ソケットが消えた場合は失敗回数に関係なく終了する。
+    // why: 接続先がなくなった後に監視を続けないため。
     fn exits_when_socket_gone() {
         assert!(should_exit(0, 5, false));
         assert!(should_exit(3, 5, false));
@@ -97,6 +98,7 @@ mod tests {
 
     #[test]
     /// ソケットがあり、失敗回数が閾値以下なら継続する。
+    // why: 失敗回数が許容範囲なら監視を早期終了しないため。
     fn continues_when_socket_present_and_under_threshold() {
         assert!(!should_exit(0, 5, true));
         assert!(!should_exit(5, 5, true));
@@ -104,6 +106,7 @@ mod tests {
 
     #[test]
     /// ソケットがあり、失敗回数が閾値を超えた場合は終了する。
+    // why: 連続失敗が上限を超えたら監視を終了するため。
     fn exits_when_socket_present_and_over_threshold() {
         assert!(should_exit(6, 5, true));
         assert!(should_exit(100, 5, true));
@@ -111,6 +114,7 @@ mod tests {
 
     #[test]
     /// 現在のプロセスIDを生存中として検出する。
+    // why: 現在のプロセスを有効なPIDとして認識するため。
     fn current_process_alive() {
         let pid = std::process::id();
         assert!(is_pid_alive(pid));
@@ -118,6 +122,7 @@ mod tests {
 
     #[test]
     /// PID 0を実プロセスの生存確認対象にせずfalseとする。
+    // why: PID 0を通常プロセスの生存確認に使わないため。
     fn dead_pid_not_alive() {
         // 非常に高確率で未使用の pid。確実に死んだ pid は取得できないため
         // `kill -0` の挙動（no such process）を信じて false を期待する。
@@ -126,6 +131,7 @@ mod tests {
 
     #[test]
     /// 状態ディレクトリ未設定時はロックなしで起動を許可する。
+    // why: 状態ディレクトリが未設定でも起動を妨げないため。
     fn unsets_env_returns_true() {
         let _g = ENV_LOCK.lock().unwrap();
         env::remove_var("HERDR_PLUGIN_STATE_DIR");
@@ -134,6 +140,7 @@ mod tests {
 
     #[test]
     /// PIDファイルがない場合は現在のPIDでロックを作成する。
+    // why: ロックがない場合に現在のプロセスが取得できるため。
     fn acquires_when_no_existing_pid() {
         use std::env::temp_dir;
         let _g = ENV_LOCK.lock().unwrap();
@@ -149,6 +156,7 @@ mod tests {
 
     #[test]
     /// 生存中のPIDが記録されたロックは二重起動を拒否する。
+    // why: 既存の監視プロセスとの二重起動を防ぐため。
     fn blocks_when_live_pid_present() {
         use std::env::temp_dir;
         let _g = ENV_LOCK.lock().unwrap();

@@ -26,7 +26,7 @@ pub fn run() -> std::io::Result<()> {
     result
 }
 
-/// 3 秒ごと（またはキー入力時）にデータを取得して redraw する。
+/// 3秒ごと、またはキー入力時にデータを取得して画面を再描画する。
 /// `q` / `Esc` でループから抜ける。
 fn run_loop<F: std::io::Write>(out: &mut F) -> std::io::Result<()> {
     let tick = Duration::from_secs(3);
@@ -66,7 +66,8 @@ mod tests {
     use crate::parsers::{format_lines, Battery, ChargingState, MemInfo};
 
     #[test]
-    /// raw modeで各行の先頭が左端に揃うようCRLFを出力する。
+    /// 端末の生モードで各行の先頭が左端に揃うようCRLFを出力する。
+    // why: 端末の生モードでも各行の開始位置を揃えるため。
     fn render_frame_aligns_rows_to_left_edge_in_raw_mode() {
         let lines = format_lines(&None, &Battery::Absent);
         let mut buf = Vec::new();
@@ -94,6 +95,7 @@ mod tests {
 
     #[test]
     /// 描画前に画面全体を消去し、カーソルを原点へ戻す。
+    // why: 再描画時に古い文字や行ずれを残さないため。
     fn render_frame_clears_and_resets_to_origin_before_printing() {
         let lines = format_lines(
             &Some(MemInfo {

@@ -49,7 +49,7 @@ popupは詳細な診断情報を表示する場所とする。数秒で理解で
 表示順は次の領域順に固定する。
 
 1. Memory: Memory used、Memory Pressure、Swap
-2. Memory consumers: Top memory processes（上位3件）
+2. Memory consumers: 関連プロセスをアプリごとに合算した上位3件
 3. Compute / Thermal: CPU utilization、Thermal State
 4. Power: Battery状態、OS推定runtime
 
@@ -102,7 +102,7 @@ Memory usedはwindow titleとpopupで同じ`vm_stat`由来の計算式・単位�
 
 Swap usageは`sysctl vm.swapusage`のcurrent snapshotを初期版で採用する。`used`と`total`をpopupに表示し、`used = 0`も有効値として扱う。`vm_stat`のSwapins / Swapoutsは累積counterであり、current usageとして表示しない。取得失敗時は`unavailable`とし、watch / window titleでは取得しない。履歴や差分は初期版では持たない。
 
-Top memory processesは`footprint`の`phys_footprint`を初期版で採用する。RSSではなくphysical footprintを表示し、表示値の意味をラベルと文書で明示する。全PIDを候補にしてpopup表示中にsnapshot取得し、通常権限で取得できないPIDはprocess単位で除外する。取得成功分からphysical footprint上位3件を選び、表示上は「取得可能なprocess内のTop 3」と明示する。watch / window titleでは取得せず、process groupingや履歴は初期版では行わない。
+2026-11-01の要件更新により、Top memory consumersは同一`.app` bundleに属するプロセスの`phys_footprint`を合算し、アプリの表示名で上位3件を表示する。詳細は[Popup app memory display design](2026-11-01-popup-app-memory-design.md)を参照する。取得はpopup表示中だけ行い、権限がないPIDは除外する。
 
 Battery percentageとCharging / discharging stateは、`IOPowerSources`を使用する。既存の`Battery`型、`ChargingState`、popup formatter、window title formatterの表示契約は変更しない。IOPowerSourcesのraw snapshot取得、state mapping、既存`Battery`型への変換を分離し、OS API failureは取得層で`Battery::Absent`へ変換する。`pmset` fallbackは採用しない。`pmset`専用parser / fixture testはIOPowerSources raw snapshot変換テストへ置き換え、既存のformatterとwindow title文字列・欠損時`n/a`テストは維持する。Estimated runtimeは`unknown` / `unlimited`を含む別metricとして独立に判断する。
 
