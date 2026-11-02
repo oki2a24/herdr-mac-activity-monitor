@@ -21,6 +21,8 @@ Herdr v1 にはプラグイン更新コマンドはないため、最新版を�
 
 ```bash
 herdr plugin install oki2a24/herdr-mac-activity-monitor
+herdr server stop
+herdr
 ```
 
 ## アンインストール
