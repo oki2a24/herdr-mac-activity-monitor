@@ -10,7 +10,11 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use crate::{battery, parsers::MemInfo, processes::MemoryConsumer};
+use crate::{
+    battery,
+    parsers::MemInfo,
+    processes::{EnergyConsumer, EnergySampleState, EnergySampler, MemoryConsumer},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// macOS のメモリプレッシャー通知を表示用の状態へ変換したもの。
@@ -58,6 +62,17 @@ pub struct SwapUsage {
     pub total_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+/// ポップアップに表示するアプリ別energyの取得状態。
+pub enum EnergyUsage {
+    /// カウンターを取得できなかった。
+    Unavailable,
+    /// 初回または新しいプロセスの基準値を取得中。
+    Sampling,
+    /// 比較できた計測間隔の平均電力上位一覧。
+    Measured(Vec<EnergyConsumer>),
+}
+
 #[derive(Debug)]
 /// ポップアップ1回分の表示データ。
 pub struct PopupSnapshot {
@@ -77,6 +92,8 @@ pub struct PopupSnapshot {
     pub battery: crate::parsers::Battery,
     /// バッテリー残り時間。
     pub runtime: battery::RuntimeEstimate,
+    /// アプリ別エネルギー使用量。
+    pub energy_usage: EnergyUsage,
 }
 
 /// ポップアップ更新に必要な、前回との差分や取得器を保持する状態。
@@ -108,16 +125,23 @@ impl PopupState {
             thermal: get_thermal_state(),
             battery: power.battery,
             runtime: power.runtime,
+            energy_usage: self.processes.energy_usage(),
         }
     }
 }
 
+struct ScannedProcessMetrics {
+    memory: Option<Vec<MemoryConsumer>>,
+    energy: Option<EnergySampleState>,
+}
+
 struct ProcessScanner {
     request: Option<Sender<()>>,
-    results: Receiver<Option<Vec<MemoryConsumer>>>,
+    results: Receiver<Option<ScannedProcessMetrics>>,
     cancel: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
     latest: Vec<MemoryConsumer>,
+    latest_energy: EnergyUsage,
     in_flight: bool,
 }
 
@@ -127,6 +151,7 @@ impl ProcessScanner {
         let (results, result_receiver) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(true));
         let worker_cancel = Arc::clone(&cancel);
+        let mut energy_sampler = EnergySampler::default();
         // 全processのfootprint snapshotは時間がかかるため、
         // TUIの描画スレッドとは分離してpopupの入力応答を止めない。
         let worker = thread::spawn(move || {
@@ -134,8 +159,16 @@ impl ProcessScanner {
                 if !worker_cancel.load(Ordering::Acquire) {
                     break;
                 }
-                let top = crate::processes::scan_top_three(Some(&worker_cancel));
-                if results.send(top).is_err() {
+                let scanned =
+                    crate::processes::scan_popup_processes(Some(&worker_cancel)).map(|scan| {
+                        ScannedProcessMetrics {
+                            memory: scan.memory,
+                            energy: scan
+                                .energy
+                                .map(|samples| energy_sampler.update(Instant::now(), samples)),
+                        }
+                    });
+                if results.send(scanned).is_err() {
                     break;
                 }
             }
@@ -146,6 +179,7 @@ impl ProcessScanner {
             cancel,
             worker: Some(worker),
             latest: Vec::new(),
+            latest_energy: EnergyUsage::Unavailable,
             in_flight: false,
         }
     }
@@ -153,7 +187,18 @@ impl ProcessScanner {
     fn collect(&mut self) -> Vec<MemoryConsumer> {
         while let Ok(result) = self.results.try_recv() {
             if let Some(result) = result {
-                self.latest = result;
+                if let Some(memory) = result.memory {
+                    self.latest = memory;
+                }
+                self.latest_energy = match result.energy {
+                    Some(EnergySampleState::Sampling) => EnergyUsage::Sampling,
+                    Some(EnergySampleState::Measured(consumers)) => {
+                        EnergyUsage::Measured(consumers)
+                    }
+                    None => EnergyUsage::Unavailable,
+                };
+            } else {
+                self.latest_energy = EnergyUsage::Unavailable;
             }
             self.in_flight = false;
         }
@@ -166,6 +211,10 @@ impl ProcessScanner {
         }
         // snapshotを取得中も直近の完了値を表示し、一覧が一時的に消えるのを防ぐ。
         self.latest.clone()
+    }
+
+    fn energy_usage(&self) -> EnergyUsage {
+        self.latest_energy.clone()
     }
 }
 
@@ -671,6 +720,14 @@ fn format_runtime(value: &battery::RuntimeEstimate) -> String {
     }
 }
 
+fn format_milliwatts(average_mw: f64) -> String {
+    if average_mw > 0.0 && average_mw < 0.1 {
+        "<0.1 mW".to_string()
+    } else {
+        format!("{average_mw:.1} mW")
+    }
+}
+
 fn format_bytes(bytes: u64) -> String {
     if bytes >= 1_000_000_000 {
         format!("{:.2} GB", bytes as f64 / 1e9)
@@ -756,13 +813,41 @@ pub fn format_popup_lines(snapshot: &PopupSnapshot) -> Vec<String> {
         "Battery runtime  {}",
         format_runtime(&snapshot.runtime)
     ));
+    lines.push(String::new());
+    lines.push("Top 3 App Energy Use".to_string());
+    lines.push("  CPU energy only; excludes GPU/ANE".to_string());
+    match &snapshot.energy_usage {
+        EnergyUsage::Unavailable => lines.push("  unavailable".to_string()),
+        EnergyUsage::Sampling => lines.push("  sampling...".to_string()),
+        EnergyUsage::Measured(consumers) if consumers.is_empty() => {
+            lines.push("  no measurable use".to_string())
+        }
+        EnergyUsage::Measured(consumers) => {
+            for consumer in consumers {
+                let process_count = if consumer.process_count > 1 {
+                    format!(" ({} processes)", consumer.process_count)
+                } else {
+                    String::new()
+                };
+                lines.push(format!(
+                    "  {} — {}{}",
+                    truncate_consumer_name(&consumer.name, 32),
+                    format_milliwatts(consumer.average_mw),
+                    process_count
+                ));
+            }
+        }
+    }
     lines
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parsers::{Battery, ChargingState, MemInfo};
+    use crate::{
+        parsers::{Battery, ChargingState, MemInfo},
+        processes::EnergyConsumer,
+    };
 
     fn snapshot() -> PopupSnapshot {
         PopupSnapshot {
@@ -781,6 +866,7 @@ mod tests {
                 bytes: 3_000_000_000,
                 process_count: 1,
             }],
+            energy_usage: EnergyUsage::Unavailable,
             cpu: CpuUtilization::Percent(12.34),
             thermal: ThermalState::Serious,
             battery: Battery::Present {
@@ -854,6 +940,71 @@ mod tests {
     }
 
     #[test]
+    /// アプリ別の平均電力と複数PID数をEnergy Use欄へ表示する。
+    // why: 実測したアプリ別energy使用量をポップアップで確認するため。
+    fn popup_displays_top_app_energy_usage_in_milliwatts() {
+        let mut value = snapshot();
+        value.energy_usage = EnergyUsage::Measured(vec![EnergyConsumer {
+            name: "Safari".to_string(),
+            average_mw: 2.5,
+            process_count: 2,
+        }]);
+
+        let lines = format_popup_lines(&value);
+
+        assert!(lines.iter().any(|line| line == "Top 3 App Energy Use"));
+        assert!(lines
+            .iter()
+            .any(|line| line == "  CPU energy only; excludes GPU/ANE"));
+        assert!(lines
+            .iter()
+            .any(|line| line == "  Safari — 2.5 mW (2 processes)"));
+    }
+
+    #[test]
+    /// 初回のenergy差分を計測中として表示する。
+    // why: 基準値しかない状態を取得不能や0 mWと取り違えないため。
+    fn popup_shows_sampling_before_first_energy_delta() {
+        let mut value = snapshot();
+        value.energy_usage = EnergyUsage::Sampling;
+
+        let lines = format_popup_lines(&value);
+
+        assert!(lines.iter().any(|line| line == "  sampling..."));
+        assert!(!lines.iter().any(|line| line.contains("0.0 mW")));
+    }
+
+    #[test]
+    /// energyカウンター取得不能を0 mWと誤表示しない。
+    // why: 権限やOS差による未取得を実測のゼロと区別するため。
+    fn popup_marks_unavailable_energy_without_zero() {
+        let mut value = snapshot();
+        value.energy_usage = EnergyUsage::Unavailable;
+
+        let lines = format_popup_lines(&value);
+
+        assert!(lines.iter().any(|line| line == "  unavailable"));
+        assert!(!lines.iter().any(|line| line.contains("0.0 mW")));
+    }
+
+    #[test]
+    /// 小さな正の電力値を0.0 mWへ丸めて隠さない。
+    // why: 表示精度未満の正の使用量を実測ゼロと誤読させないため。
+    fn popup_does_not_round_small_positive_energy_to_zero() {
+        let mut value = snapshot();
+        value.energy_usage = EnergyUsage::Measured(vec![EnergyConsumer {
+            name: "Low Power App".to_string(),
+            average_mw: 0.04,
+            process_count: 1,
+        }]);
+
+        let lines = format_popup_lines(&value);
+
+        assert!(lines.iter().any(|line| line == "  Low Power App — <0.1 mW"));
+        assert!(!lines.iter().any(|line| line.contains("0.0 mW")));
+    }
+
+    #[test]
     /// 更新中も直近に取得した項目一覧を表示し続ける。
     // why: 更新に時間がかかる間も、表示中の一覧を消さないため。
     fn process_scanner_retains_latest_snapshot_while_refreshing() {
@@ -862,6 +1013,11 @@ mod tests {
             bytes: 2_000_000_000,
             process_count: 1,
         }];
+        let latest_energy = EnergyUsage::Measured(vec![EnergyConsumer {
+            name: "Safari".to_string(),
+            average_mw: 2.5,
+            process_count: 1,
+        }]);
         let (request, _requests) = mpsc::channel();
         let (_result_sender, results) = mpsc::channel();
         let mut scanner = ProcessScanner {
@@ -870,21 +1026,28 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(true)),
             worker: None,
             latest: latest.clone(),
+            latest_energy: latest_energy.clone(),
             in_flight: true,
         };
 
         assert_eq!(scanner.collect(), latest);
+        assert_eq!(scanner.energy_usage(), latest_energy);
     }
 
     #[test]
     /// 取得失敗時に直近の項目一覧を空の結果で上書きしない。
     // why: 取得失敗を空の正常結果と取り違えないため。
-    fn process_scanner_retains_latest_snapshot_after_failed_refresh() {
+    fn process_scanner_retains_memory_but_marks_energy_unavailable_after_failed_refresh() {
         let latest = vec![MemoryConsumer {
             name: "Safari".to_string(),
             bytes: 2_000_000_000,
             process_count: 1,
         }];
+        let latest_energy = EnergyUsage::Measured(vec![EnergyConsumer {
+            name: "Safari".to_string(),
+            average_mw: 2.5,
+            process_count: 1,
+        }]);
         let (request, _requests) = mpsc::channel();
         let (result_sender, results) = mpsc::channel();
         result_sender.send(None).unwrap();
@@ -894,10 +1057,12 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(true)),
             worker: None,
             latest: latest.clone(),
+            latest_energy: latest_energy.clone(),
             in_flight: true,
         };
 
         assert_eq!(scanner.collect(), latest);
+        assert_eq!(scanner.energy_usage(), EnergyUsage::Unavailable);
     }
 
     #[test]

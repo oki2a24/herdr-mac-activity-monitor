@@ -195,9 +195,19 @@ macOS自身が現在のメモリ状況をどのように評価しているかを
 - 現在のBattery drain
 - 平均Battery drain
 - 推定残り稼働時間
+- アプリ別エネルギー使用量（計測間隔の平均電力、上位3件）
 
 現在すでに存在するBattery percentageと
 Charging / discharging stateは維持する。
+
+アプリ別エネルギー使用量は、ポップアップ表示中に取得した
+`proc_pid_rusage` のCPU由来累積energy counter差分を使い、同一`.app` bundleの
+プロセスを合算して平均mWの上位3件を表示する。GPU/ANEを含むアプリ全体の
+電力ではないことをポップアップ内で明示する
+（[Apple XNU Recount documentation](https://github.com/apple-oss-distributions/xnu/blob/main/doc/observability/recount.md)）。
+対象は現在のユーザーから読めるプロセスに限る。
+これはActivity Monitorのunitless Energy Impact scoreや、
+システム全体のバッテリー消費量を示すものではない。
 
 平均Battery drainや推定残り稼働時間など、
 過去のsamplingを必要とする指標については、
@@ -222,6 +232,7 @@ Technical Researchで調査したうえで決定する。
 - Battery percentage
 - Charging / discharging state
 - Battery drain
+- Top app energy use
 
 
 ### Technical Researchの結果によって判断

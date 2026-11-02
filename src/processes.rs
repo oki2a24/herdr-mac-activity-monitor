@@ -22,6 +22,15 @@ pub struct MemoryConsumer {
     pub process_count: usize,
 }
 
+#[derive(Debug)]
+/// ポップアップの1回のプロセス取得結果。memoryとenergyは独立して失敗し得る。
+pub(crate) struct PopupProcessScan {
+    /// footprintから取得したアプリ別上位一覧。
+    pub(crate) memory: Option<Vec<MemoryConsumer>>,
+    /// 現在のユーザーのプロセスenergy counter。
+    pub(crate) energy: Option<Vec<ProcessEnergySample>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProcessMemory {
     pid: u32,
@@ -34,6 +43,122 @@ struct ProcessMemory {
 struct AppBundle {
     path: PathBuf,
     name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+/// プロセス別エネルギー差分をアプリ単位にまとめた平均電力。
+pub(crate) struct EnergyConsumer {
+    /// アプリまたはプロセスの表示名。
+    pub(crate) name: String,
+    /// 計測間隔中の平均電力（mW）。
+    pub(crate) average_mw: f64,
+    /// 差分を計測できたプロセス数。
+    pub(crate) process_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// 1回のプロセスエネルギーカウンター取得値。
+pub(crate) struct ProcessEnergySample {
+    pid: u32,
+    started_at: u64,
+    energy_nj: u64,
+    name: String,
+    application: Option<AppBundle>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+/// 前回sampleとの比較状態と、計測できたアプリ一覧。
+pub(crate) enum EnergySampleState {
+    /// 初回または比較可能なプロセスがまだない。
+    Sampling,
+    /// 比較可能なプロセスを処理した。
+    Measured(Vec<EnergyConsumer>),
+}
+
+#[derive(Default)]
+/// プロセスごとの累積値から計測間隔内の平均電力を算出する。
+pub(crate) struct EnergySampler {
+    previous: HashMap<u32, ProcessEnergySample>,
+    sampled_at: Option<Instant>,
+}
+
+impl EnergySampler {
+    /// 現在のsampleを前回値と照合し、アプリ別の平均電力上位3件を返す。
+    pub(crate) fn update(
+        &mut self,
+        sampled_at: Instant,
+        current: Vec<ProcessEnergySample>,
+    ) -> EnergySampleState {
+        #[derive(Hash, PartialEq, Eq)]
+        enum GroupKey {
+            Application(PathBuf),
+            Process(u32),
+        }
+
+        let current = current
+            .into_iter()
+            .map(|sample| (sample.pid, sample))
+            .collect::<HashMap<_, _>>();
+        let previous = std::mem::replace(&mut self.previous, current);
+        let previous_at = self.sampled_at.replace(sampled_at);
+        let Some(elapsed) = previous_at
+            .and_then(|previous_at| sampled_at.checked_duration_since(previous_at))
+            .filter(|elapsed| !elapsed.is_zero())
+        else {
+            return EnergySampleState::Sampling;
+        };
+
+        let mut comparable_processes = false;
+        let mut grouped = HashMap::<GroupKey, (String, u64, usize)>::new();
+        for sample in self.previous.values() {
+            let Some(previous) = previous.get(&sample.pid) else {
+                continue;
+            };
+            if previous.started_at != sample.started_at {
+                continue;
+            }
+            let Some(delta_nj) = sample.energy_nj.checked_sub(previous.energy_nj) else {
+                continue;
+            };
+            comparable_processes = true;
+            if delta_nj == 0 {
+                continue;
+            }
+
+            let (key, name) = match &sample.application {
+                Some(application) => (
+                    GroupKey::Application(application.path.clone()),
+                    application.name.clone(),
+                ),
+                None => (GroupKey::Process(sample.pid), sample.name.clone()),
+            };
+            let entry = grouped.entry(key).or_insert((name, 0, 0));
+            entry.1 = entry.1.saturating_add(delta_nj);
+            entry.2 += 1;
+        }
+
+        if !comparable_processes {
+            return EnergySampleState::Sampling;
+        }
+
+        let elapsed_seconds = elapsed.as_secs_f64();
+        let mut consumers = grouped
+            .into_values()
+            .map(|(name, energy_nj, process_count)| EnergyConsumer {
+                name,
+                average_mw: energy_nj as f64 / elapsed_seconds / 1_000_000.0,
+                process_count,
+            })
+            .collect::<Vec<_>>();
+        consumers.sort_by(|left, right| {
+            right
+                .average_mw
+                .total_cmp(&left.average_mw)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        consumers.truncate(3);
+        EnergySampleState::Measured(consumers)
+    }
 }
 
 /// `footprint` の出力からphysical footprintを取り出す。
@@ -219,11 +344,11 @@ fn top_three(processes: Vec<ProcessMemory>) -> Vec<MemoryConsumer> {
     consumers
 }
 
-/// 現在のユーザーのプロセスから、アプリ単位のphysical footprint上位3件を返す。
-/// 取得に失敗した場合は`None`を返す。一括取得はポップアップ専用の別スレッドで実行し、
-/// ポップアップ終了時にキャンセルする。
-pub fn scan_top_three(cancel: Option<&AtomicBool>) -> Option<Vec<MemoryConsumer>> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+/// 現在のユーザーのPIDを一度列挙し、popup用memoryとenergyを取得する。
+/// PID列挙に失敗した場合は`None`を返す。高コストの取得はpopup workerから呼び出す。
+pub(crate) fn scan_popup_processes(cancel: Option<&AtomicBool>) -> Option<PopupProcessScan> {
+    const PROCESS_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
+    let deadline = Instant::now() + PROCESS_SCAN_TIMEOUT;
     let mut ps_command = Command::new("ps");
     ps_command
         .args(["-axo", "ruid=,pid="])
@@ -235,10 +360,42 @@ pub fn scan_top_three(cancel: Option<&AtomicBool>) -> Option<Vec<MemoryConsumer>
     }
     let pids =
         parse_process_ids_for_real_uid(&String::from_utf8_lossy(&ps_output), current_real_uid());
+    Some(scan_popup_sources_with_independent_deadlines(
+        &pids,
+        cancel,
+        PROCESS_SCAN_TIMEOUT,
+        scan_memory_top_three,
+        scan_process_energy,
+    ))
+}
+
+fn scan_popup_sources_with_independent_deadlines<MemoryScan, EnergyScan>(
+    pids: &[u32],
+    cancel: Option<&AtomicBool>,
+    timeout: Duration,
+    scan_memory: MemoryScan,
+    scan_energy: EnergyScan,
+) -> PopupProcessScan
+where
+    MemoryScan: FnOnce(&[u32], Instant, Option<&AtomicBool>) -> Option<Vec<MemoryConsumer>>,
+    EnergyScan: FnOnce(&[u32], Instant, Option<&AtomicBool>) -> Option<Vec<ProcessEnergySample>>,
+{
+    // footprintのtimeoutで、直接取得できるenergyカウンターまで打ち切らない。
+    let memory_deadline = Instant::now() + timeout;
+    let memory = scan_memory(pids, memory_deadline, cancel);
+    let energy_deadline = Instant::now() + timeout;
+    let energy = scan_energy(pids, energy_deadline, cancel);
+    PopupProcessScan { memory, energy }
+}
+
+fn scan_memory_top_three(
+    pids: &[u32],
+    deadline: Instant,
+    cancel: Option<&AtomicBool>,
+) -> Option<Vec<MemoryConsumer>> {
     if pids.is_empty() {
         return Some(Vec::new());
     }
-
     let mut command = Command::new("footprint");
     command.args(["--noCategories", "--format", "bytes"]);
     for pid in pids {
@@ -255,12 +412,88 @@ pub fn scan_top_three(cancel: Option<&AtomicBool>) -> Option<Vec<MemoryConsumer>
     Some(top_three(processes))
 }
 
+fn scan_process_energy(
+    pids: &[u32],
+    deadline: Instant,
+    cancel: Option<&AtomicBool>,
+) -> Option<Vec<ProcessEnergySample>> {
+    if pids.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut samples = Vec::new();
+    let mut app_names = HashMap::<PathBuf, String>::new();
+    for &pid in pids {
+        if cancel.is_some_and(|flag| !flag.load(Ordering::Acquire)) || Instant::now() >= deadline {
+            return None;
+        }
+        let Some((started_at, energy_nj)) = process_energy_usage(pid) else {
+            continue;
+        };
+        let path = process_executable_path(pid).map(PathBuf::from);
+        let application = path
+            .as_deref()
+            .and_then(outermost_app_bundle)
+            .map(|app_path| {
+                let name = app_names
+                    .entry(app_path.clone())
+                    .or_insert_with(|| display_name_for_bundle(&app_path))
+                    .clone();
+                AppBundle {
+                    path: app_path,
+                    name,
+                }
+            });
+        let process_name = path
+            .as_deref()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown");
+        let name = application
+            .as_ref()
+            .map(|application| application.name.clone())
+            .unwrap_or_else(|| readable_process_name(process_name, pid, path.as_deref()));
+        samples.push(ProcessEnergySample {
+            pid,
+            started_at,
+            energy_nj,
+            name,
+            application,
+        });
+    }
+
+    (!samples.is_empty()).then_some(samples)
+}
+
 fn current_real_uid() -> u32 {
     unsafe extern "C" {
         fn getuid() -> u32;
     }
     // SAFETY: getuid reads the current process's real user ID and has no preconditions.
     unsafe { getuid() }
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct RusageInfoV6 {
+    _uuid: [u8; 16],
+    values: [u64; 56],
+}
+
+#[cfg(target_os = "macos")]
+fn decode_energy_fields(usage: &RusageInfoV6) -> (u64, u64) {
+    // sys/resource.h: ri_proc_start_abstime is field 8; ri_energy_nj is field 40.
+    (usage.values[8], usage.values[40])
+}
+
+#[cfg(target_os = "macos")]
+fn process_energy_usage(pid: u32) -> Option<(u64, u64)> {
+    macos::process_energy_usage(pid)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_energy_usage(_pid: u32) -> Option<(u64, u64)> {
+    None
 }
 
 #[cfg(target_os = "macos")]
@@ -296,6 +529,7 @@ mod macos {
     #[link(name = "proc")]
     unsafe extern "C" {
         fn proc_pidpath(pid: i32, buffer: *mut c_void, buffersize: u32) -> i32;
+        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut c_void) -> i32;
     }
 
     #[link(name = "Foundation", kind = "framework")]
@@ -334,6 +568,25 @@ mod macos {
         // SAFETY: proc_pidpath writes a null-terminated path into the supplied buffer.
         let path = unsafe { CStr::from_ptr(buffer.as_ptr().cast()) };
         Some(path.to_string_lossy().into_owned())
+    }
+
+    pub(super) fn process_energy_usage(pid: u32) -> Option<(u64, u64)> {
+        const RUSAGE_INFO_V6: i32 = 6;
+        let mut usage = super::RusageInfoV6 {
+            _uuid: [0; 16],
+            values: [0; 56],
+        };
+        let result = unsafe {
+            proc_pid_rusage(
+                i32::try_from(pid).ok()?,
+                RUSAGE_INFO_V6,
+                (&mut usage as *mut super::RusageInfoV6).cast::<c_void>(),
+            )
+        };
+        if result != 0 {
+            return None;
+        }
+        Some(super::decode_energy_fields(&usage))
     }
 
     pub(super) fn file_manager_display_name(path: &Path) -> Option<String> {
@@ -492,6 +745,49 @@ fn set_nonblocking(fd: i32) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    fn energy_sample(
+        pid: u32,
+        started_at: u64,
+        energy_nj: u64,
+        application_name: &str,
+    ) -> ProcessEnergySample {
+        ProcessEnergySample {
+            pid,
+            started_at,
+            energy_nj,
+            name: application_name.to_string(),
+            application: Some(AppBundle {
+                path: PathBuf::from(format!("/Applications/{application_name}.app")),
+                name: application_name.to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    /// メモリ取得の時間切れ後もenergy取得には独立した時間枠を与える。
+    // why: footprintの遅延だけでenergyカウンターの取得機会を失わないため。
+    fn popup_energy_scan_gets_a_fresh_deadline_after_memory_times_out() {
+        let scanned = scan_popup_sources_with_independent_deadlines(
+            &[123],
+            None,
+            Duration::from_millis(30),
+            |_, deadline, _| {
+                while Instant::now() <= deadline {
+                    std::thread::yield_now();
+                }
+                None
+            },
+            |_, deadline, _| {
+                assert!(Instant::now() < deadline);
+                Some(Vec::new())
+            },
+        );
+
+        assert!(scanned.memory.is_none());
+        assert_eq!(scanned.energy, Some(Vec::new()));
+    }
 
     #[test]
     /// footprint出力からphysical footprintの数値を取り出す。
@@ -690,6 +986,113 @@ Auxiliary data:
                 ("Safari", 2_000_000_000, 1),
                 ("Code", 1_000_000_000, 1),
             ]
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    /// rusage v6からプロセス開始時刻とenergyカウンターの正しい位置を読む。
+    // why: 似た名前のフィールドを誤って読み違えるとPID再利用と使用量を誤認するため。
+    fn rusage_v6_extracts_process_start_and_energy_counter_fields() {
+        let mut usage = RusageInfoV6 {
+            _uuid: [0; 16],
+            values: [0; 56],
+        };
+        usage.values[8] = 123_456;
+        usage.values[40] = 987_654_321;
+
+        assert_eq!(decode_energy_fields(&usage), (123_456, 987_654_321));
+    }
+
+    #[test]
+    /// helper分を合算し、平均電力の降順で上位3アプリを選ぶ。
+    // why: プロセス単位の上位選定や逆順ソートがアプリ順位を壊すため。
+    fn energy_sampler_aggregates_before_ranking_and_returns_average_milliwatts() {
+        let start = Instant::now();
+        let mut sampler = EnergySampler::default();
+        let previous = vec![
+            energy_sample(1, 1, 0, "Browser"),
+            energy_sample(2, 2, 0, "Browser"),
+            energy_sample(3, 3, 0, "Browser"),
+            energy_sample(4, 4, 0, "Browser"),
+            energy_sample(5, 5, 0, "Editor"),
+            energy_sample(6, 6, 0, "Chat"),
+            energy_sample(7, 7, 0, "Mail"),
+        ];
+        assert_eq!(sampler.update(start, previous), EnergySampleState::Sampling);
+
+        let current = vec![
+            energy_sample(1, 1, 100_000_000, "Browser"),
+            energy_sample(2, 2, 100_000_000, "Browser"),
+            energy_sample(3, 3, 100_000_000, "Browser"),
+            energy_sample(4, 4, 100_000_000, "Browser"),
+            energy_sample(5, 5, 350_000_000, "Editor"),
+            energy_sample(6, 6, 300_000_000, "Chat"),
+            energy_sample(7, 7, 250_000_000, "Mail"),
+        ];
+        let result = sampler.update(start + Duration::from_secs(2), current);
+
+        let EnergySampleState::Measured(consumers) = result else {
+            panic!("second comparable sample should report measured energy");
+        };
+        assert_eq!(
+            consumers
+                .iter()
+                .map(|consumer| (
+                    consumer.name.as_str(),
+                    consumer.average_mw,
+                    consumer.process_count,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Browser", 200.0, 4),
+                ("Editor", 175.0, 1),
+                ("Chat", 150.0, 1),
+            ]
+        );
+    }
+
+    #[test]
+    /// 新規PID・再利用PID・逆行カウンターを除き、同一プロセスの差分を使う。
+    // why: 起動前の累積値や別プロセスの値を現在の使用量に混ぜないため。
+    fn energy_sampler_uses_elapsed_time_and_ignores_new_reused_or_reset_pids() {
+        let start = Instant::now();
+        let mut sampler = EnergySampler::default();
+        assert_eq!(
+            sampler.update(
+                start,
+                vec![
+                    energy_sample(10, 100, 10_000_000, "Stable"),
+                    energy_sample(20, 200, 10_000_000, "Reused"),
+                    energy_sample(30, 300, 10_000_000, "Reset"),
+                ],
+            ),
+            EnergySampleState::Sampling
+        );
+
+        let result = sampler.update(
+            start + Duration::from_secs(1),
+            vec![
+                energy_sample(10, 100, 10_100_000, "Stable"),
+                energy_sample(20, 201, 900_000_000, "Reused"),
+                energy_sample(30, 300, 9_000_000, "Reset"),
+                energy_sample(40, 400, 500_000_000, "New"),
+            ],
+        );
+
+        let EnergySampleState::Measured(consumers) = result else {
+            panic!("stable process should have a comparable interval");
+        };
+        assert_eq!(
+            consumers
+                .iter()
+                .map(|consumer| (
+                    consumer.name.as_str(),
+                    consumer.average_mw,
+                    consumer.process_count,
+                ))
+                .collect::<Vec<_>>(),
+            vec![("Stable", 0.1, 1)]
         );
     }
 
