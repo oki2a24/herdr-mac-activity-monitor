@@ -11,6 +11,33 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// プロセス情報取得で使う補助コマンドの実行境界。
+pub(crate) trait ProcessCommandRunner {
+    /// コマンドを期限とキャンセル状態に従って実行し、終了状態と標準出力を返す。
+    fn run(
+        &self,
+        command: Command,
+        deadline: Instant,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<(bool, Vec<u8>)>;
+}
+
+/// OSの子プロセスを起動し、期限またはキャンセルまで待機する。
+pub(crate) struct SystemProcessCommandRunner;
+
+impl ProcessCommandRunner for SystemProcessCommandRunner {
+    fn run(
+        &self,
+        command: Command,
+        deadline: Instant,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<(bool, Vec<u8>)> {
+        let child = spawn_with_suppressed_stderr(command)?;
+        let (status, output) = wait_for_child(child, deadline, cancel)?;
+        Some((status.success(), output))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// アプリ、または個別プロセスのメモリ使用量。
 pub struct MemoryConsumer {
@@ -251,7 +278,11 @@ fn outermost_app_bundle(executable_path: &Path) -> Option<PathBuf> {
 }
 
 fn display_name_for_bundle(path: &Path) -> String {
-    file_manager_display_name(path)
+    bundle_display_name(path, file_manager_display_name(path))
+}
+
+fn bundle_display_name(path: &Path, platform_display_name: Option<String>) -> String {
+    platform_display_name
         .and_then(|display_name| {
             Path::new(&display_name)
                 .file_name()
@@ -265,6 +296,11 @@ fn display_name_for_bundle(path: &Path) -> String {
                 .map(|name| name.strip_suffix(".app").unwrap_or(name).to_string())
         })
         .unwrap_or_else(|| "Unknown app".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn either_objc_object_is_null(left: *mut std::ffi::c_void, right: *mut std::ffi::c_void) -> bool {
+    left.is_null() || right.is_null()
 }
 
 fn is_system_path(path: &Path) -> bool {
@@ -290,15 +326,22 @@ fn readable_process_name(name: &str, pid: u32, path: Option<&Path>) -> String {
     format!("{category} · {name} (PID {pid})")
 }
 
-fn attribute_processes(processes: &mut [ProcessMemory]) {
+fn attribute_processes<ResolvePath, DisplayName>(
+    processes: &mut [ProcessMemory],
+    mut resolve_path: ResolvePath,
+    mut display_name: DisplayName,
+) where
+    ResolvePath: FnMut(u32) -> Option<String>,
+    DisplayName: FnMut(&Path) -> String,
+{
     let mut app_names = HashMap::<PathBuf, String>::new();
     for process in processes {
-        let path = process_executable_path(process.pid).map(PathBuf::from);
+        let path = resolve_path(process.pid).map(PathBuf::from);
         let app_path = path.as_deref().and_then(outermost_app_bundle);
         if let Some(app_path) = app_path {
             let name = app_names
                 .entry(app_path.clone())
-                .or_insert_with(|| display_name_for_bundle(&app_path))
+                .or_insert_with(|| display_name(&app_path))
                 .clone();
             process.application = Some(AppBundle {
                 path: app_path,
@@ -346,27 +389,81 @@ fn top_three(processes: Vec<ProcessMemory>) -> Vec<MemoryConsumer> {
 
 /// 現在のユーザーのPIDを一度列挙し、popup用memoryとenergyを取得する。
 /// PID列挙に失敗した場合は`None`を返す。高コストの取得はpopup workerから呼び出す。
-pub(crate) fn scan_popup_processes(cancel: Option<&AtomicBool>) -> Option<PopupProcessScan> {
+pub(crate) fn scan_popup_processes(
+    cancel: Option<&AtomicBool>,
+    command_runner: &dyn ProcessCommandRunner,
+) -> Option<PopupProcessScan> {
     const PROCESS_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
-    let deadline = Instant::now() + PROCESS_SCAN_TIMEOUT;
+    scan_popup_processes_with(
+        cancel,
+        PROCESS_SCAN_TIMEOUT,
+        |deadline, cancel| run_process_list_command(command_runner, deadline, cancel),
+        current_real_uid,
+        |pids, deadline, cancel| {
+            scan_memory_top_three(
+                pids,
+                deadline,
+                cancel,
+                |pids, deadline, cancel| {
+                    run_footprint_command(command_runner, pids, deadline, cancel)
+                },
+                |processes| {
+                    attribute_processes(processes, process_executable_path, display_name_for_bundle)
+                },
+            )
+        },
+        |pids, deadline, cancel| {
+            scan_process_energy(
+                pids,
+                deadline,
+                cancel,
+                process_energy_usage,
+                process_executable_path,
+                display_name_for_bundle,
+            )
+        },
+    )
+}
+
+fn scan_popup_processes_with<ProcessListScan, RealUid, MemoryScan, EnergyScan>(
+    cancel: Option<&AtomicBool>,
+    timeout: Duration,
+    scan_process_list: ProcessListScan,
+    real_uid: RealUid,
+    scan_memory: MemoryScan,
+    scan_energy: EnergyScan,
+) -> Option<PopupProcessScan>
+where
+    ProcessListScan: FnOnce(Instant, Option<&AtomicBool>) -> Option<(bool, Vec<u8>)>,
+    RealUid: FnOnce() -> u32,
+    MemoryScan: FnOnce(&[u32], Instant, Option<&AtomicBool>) -> Option<Vec<MemoryConsumer>>,
+    EnergyScan: FnOnce(&[u32], Instant, Option<&AtomicBool>) -> Option<Vec<ProcessEnergySample>>,
+{
+    let deadline = Instant::now() + timeout;
+    let (success, ps_output) = scan_process_list(deadline, cancel)?;
+    if !success {
+        return None;
+    }
+    let pids = parse_process_ids_for_real_uid(&String::from_utf8_lossy(&ps_output), real_uid());
+    Some(scan_popup_sources_with_independent_deadlines(
+        &pids,
+        cancel,
+        timeout,
+        scan_memory,
+        scan_energy,
+    ))
+}
+
+fn run_process_list_command(
+    command_runner: &dyn ProcessCommandRunner,
+    deadline: Instant,
+    cancel: Option<&AtomicBool>,
+) -> Option<(bool, Vec<u8>)> {
     let mut ps_command = Command::new("ps");
     ps_command
         .args(["-axo", "ruid=,pid="])
         .stdout(Stdio::piped());
-    let ps_child = spawn_with_suppressed_stderr(ps_command)?;
-    let (ps_status, ps_output) = wait_for_child(ps_child, deadline, cancel)?;
-    if !ps_status.success() {
-        return None;
-    }
-    let pids =
-        parse_process_ids_for_real_uid(&String::from_utf8_lossy(&ps_output), current_real_uid());
-    Some(scan_popup_sources_with_independent_deadlines(
-        &pids,
-        cancel,
-        PROCESS_SCAN_TIMEOUT,
-        scan_memory_top_three,
-        scan_process_energy,
-    ))
+    command_runner.run(ps_command, deadline, cancel)
 }
 
 fn scan_popup_sources_with_independent_deadlines<MemoryScan, EnergyScan>(
@@ -388,35 +485,58 @@ where
     PopupProcessScan { memory, energy }
 }
 
-fn scan_memory_top_three(
+fn scan_memory_top_three<FootprintScan, Attribute>(
     pids: &[u32],
     deadline: Instant,
     cancel: Option<&AtomicBool>,
-) -> Option<Vec<MemoryConsumer>> {
+    scan_footprint: FootprintScan,
+    attribute: Attribute,
+) -> Option<Vec<MemoryConsumer>>
+where
+    FootprintScan: FnOnce(&[u32], Instant, Option<&AtomicBool>) -> Option<(bool, Vec<u8>)>,
+    Attribute: FnOnce(&mut [ProcessMemory]),
+{
     if pids.is_empty() {
         return Some(Vec::new());
     }
+
+    let (success, output) = scan_footprint(pids, deadline, cancel)?;
+    let mut processes = parse_footprint_processes(&String::from_utf8_lossy(&output));
+    if processes.is_empty() && !success {
+        return None;
+    }
+    attribute(&mut processes);
+    Some(top_three(processes))
+}
+
+fn run_footprint_command(
+    command_runner: &dyn ProcessCommandRunner,
+    pids: &[u32],
+    deadline: Instant,
+    cancel: Option<&AtomicBool>,
+) -> Option<(bool, Vec<u8>)> {
     let mut command = Command::new("footprint");
     command.args(["--noCategories", "--format", "bytes"]);
     for pid in pids {
         command.arg("--pid").arg(pid.to_string());
     }
     command.stdout(Stdio::piped());
-    let child = spawn_with_suppressed_stderr(command)?;
-    let (status, output) = wait_for_child(child, deadline, cancel)?;
-    let mut processes = parse_footprint_processes(&String::from_utf8_lossy(&output));
-    if processes.is_empty() && !status.success() {
-        return None;
-    }
-    attribute_processes(&mut processes);
-    Some(top_three(processes))
+    command_runner.run(command, deadline, cancel)
 }
 
-fn scan_process_energy(
+fn scan_process_energy<ReadEnergy, ResolvePath, DisplayName>(
     pids: &[u32],
     deadline: Instant,
     cancel: Option<&AtomicBool>,
-) -> Option<Vec<ProcessEnergySample>> {
+    mut read_energy: ReadEnergy,
+    mut resolve_path: ResolvePath,
+    mut display_name: DisplayName,
+) -> Option<Vec<ProcessEnergySample>>
+where
+    ReadEnergy: FnMut(u32) -> Option<(u64, u64)>,
+    ResolvePath: FnMut(u32) -> Option<String>,
+    DisplayName: FnMut(&Path) -> String,
+{
     if pids.is_empty() {
         return Some(Vec::new());
     }
@@ -427,17 +547,17 @@ fn scan_process_energy(
         if cancel.is_some_and(|flag| !flag.load(Ordering::Acquire)) || Instant::now() >= deadline {
             return None;
         }
-        let Some((started_at, energy_nj)) = process_energy_usage(pid) else {
+        let Some((started_at, energy_nj)) = read_energy(pid) else {
             continue;
         };
-        let path = process_executable_path(pid).map(PathBuf::from);
+        let path = resolve_path(pid).map(PathBuf::from);
         let application = path
             .as_deref()
             .and_then(outermost_app_bundle)
             .map(|app_path| {
                 let name = app_names
                     .entry(app_path.clone())
-                    .or_insert_with(|| display_name_for_bundle(&app_path))
+                    .or_insert_with(|| display_name(&app_path))
                     .clone();
                 AppBundle {
                     path: app_path,
@@ -544,11 +664,15 @@ mod macos {
         fn objc_autoreleasePoolPop(context: *mut c_void);
     }
 
-    struct AutoreleasePool(*mut c_void);
+    struct AutoreleasePool {
+        context: *mut c_void,
+        pop: unsafe extern "C" fn(*mut c_void),
+    }
 
     impl Drop for AutoreleasePool {
         fn drop(&mut self) {
-            unsafe { objc_autoreleasePoolPop(self.0) };
+            // SAFETY: The context matches the pop function stored when this guard was created.
+            unsafe { (self.pop)(self.context) };
         }
     }
 
@@ -590,7 +714,11 @@ mod macos {
     }
 
     pub(super) fn file_manager_display_name(path: &Path) -> Option<String> {
-        let pool = AutoreleasePool(unsafe { objc_autoreleasePoolPush() });
+        let pool = AutoreleasePool {
+            // SAFETY: Push creates a pool context consumed by `Drop` below.
+            context: unsafe { objc_autoreleasePoolPush() },
+            pop: objc_autoreleasePoolPop,
+        };
         let class_name = CString::new("NSFileManager").ok()?;
         let default_manager = CString::new("defaultManager").ok()?;
         let string_class_name = CString::new("NSString").ok()?;
@@ -601,14 +729,14 @@ mod macos {
 
         let manager_class = unsafe { objc_getClass(class_name.as_ptr()) };
         let string_class = unsafe { objc_getClass(string_class_name.as_ptr()) };
-        if manager_class.is_null() || string_class.is_null() {
+        if super::either_objc_object_is_null(manager_class, string_class) {
             drop(pool);
             return None;
         }
 
         let manager = send0(manager_class, selector(&default_manager));
         let path_string = send_string(string_class, selector(&string_with_utf8), path.as_ptr());
-        if manager.is_null() || path_string.is_null() {
+        if super::either_objc_object_is_null(manager, path_string) {
             drop(pool);
             return None;
         }
@@ -661,6 +789,38 @@ mod macos {
         let send: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void =
             unsafe { std::mem::transmute(objc_msgSend as *const ()) };
         unsafe { send(receiver, selector, value) }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::AutoreleasePool;
+        use std::{
+            ffi::c_void,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+
+        unsafe extern "C" fn record_pop(context: *mut c_void) {
+            // SAFETY: The test passes a live AtomicUsize pointer and drops the pool before it.
+            let pop_count = unsafe { &*context.cast::<AtomicUsize>() };
+            pop_count.fetch_add(1, Ordering::Relaxed);
+        }
+
+        #[test]
+        /// autorelease poolのdrop時に対応するpop処理を呼び出す。
+        // why: poolを解放しないと、繰り返しの表示名取得でautoreleased objectが蓄積するため。
+        fn autorelease_pool_drop_invokes_pop() {
+            let pop_count = AtomicUsize::new(0);
+            let pool = AutoreleasePool {
+                context: (&pop_count as *const AtomicUsize)
+                    .cast_mut()
+                    .cast::<c_void>(),
+                pop: record_pop,
+            };
+
+            drop(pool);
+
+            assert_eq!(pop_count.load(Ordering::Relaxed), 1);
+        }
     }
 }
 
@@ -725,17 +885,39 @@ fn drain_available(reader: &mut impl Read, output: &mut Vec<u8>) -> io::Result<(
 fn set_nonblocking(fd: i32) -> io::Result<()> {
     const F_GETFL: i32 = 3;
     const F_SETFL: i32 = 4;
-    const O_NONBLOCK: i32 = 0x0004;
     unsafe extern "C" {
         fn fcntl(fd: i32, command: i32, ...) -> i32;
     }
-    // SAFETY: `fd` is the live stdout descriptor owned by the child process handle.
-    let flags = unsafe { fcntl(fd, F_GETFL) };
+
+    set_nonblocking_with(
+        fd,
+        |fd| {
+            // SAFETY: `fd` is the live stdout descriptor owned by the child process handle.
+            unsafe { fcntl(fd, F_GETFL) }
+        },
+        |fd, flags| {
+            // SAFETY: fcntl receives the descriptor, command, and flags expected by macOS.
+            unsafe { fcntl(fd, F_SETFL, flags) }
+        },
+    )
+}
+
+fn set_nonblocking_with<GetFlags, SetFlags>(
+    fd: i32,
+    get_flags: GetFlags,
+    set_flags: SetFlags,
+) -> io::Result<()>
+where
+    GetFlags: FnOnce(i32) -> i32,
+    SetFlags: FnOnce(i32, i32) -> i32,
+{
+    const O_NONBLOCK: i32 = 0x0004;
+
+    let flags = get_flags(fd);
     if flags < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: fcntl receives the descriptor, command, and integer flags expected by macOS.
-    if unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } < 0 {
+    if set_flags(fd, flags | O_NONBLOCK) < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -744,8 +926,47 @@ fn set_nonblocking(fd: i32) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct RecordedCommand {
+        program: String,
+        args: Vec<String>,
+    }
+
+    struct FakeProcessCommandRunner {
+        result: Option<(bool, Vec<u8>)>,
+        commands: RefCell<Vec<RecordedCommand>>,
+    }
+
+    impl FakeProcessCommandRunner {
+        fn new(result: Option<(bool, Vec<u8>)>) -> Self {
+            Self {
+                result,
+                commands: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ProcessCommandRunner for FakeProcessCommandRunner {
+        fn run(
+            &self,
+            command: Command,
+            _deadline: Instant,
+            _cancel: Option<&AtomicBool>,
+        ) -> Option<(bool, Vec<u8>)> {
+            self.commands.borrow_mut().push(RecordedCommand {
+                program: command.get_program().to_string_lossy().into_owned(),
+                args: command
+                    .get_args()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect(),
+            });
+            self.result.clone()
+        }
+    }
 
     fn energy_sample(
         pid: u32,
@@ -766,14 +987,155 @@ mod tests {
     }
 
     #[test]
+    /// popup用の本番入口が注入された実行役でPID一覧を取得する。
+    // why: 本番入口からコマンド境界までの配線を実機のプロセス一覧に依存せず確認するため。
+    fn popup_process_scan_uses_injected_command_runner() {
+        let runner = FakeProcessCommandRunner::new(Some((true, Vec::new())));
+
+        let scanned = scan_popup_processes(None, &runner)
+            .expect("a successful empty process listing should produce an empty scan");
+
+        assert_eq!(scanned.memory, Some(Vec::new()));
+        assert_eq!(scanned.energy, Some(Vec::new()));
+        assert_eq!(
+            *runner.commands.borrow(),
+            vec![RecordedCommand {
+                program: "ps".to_string(),
+                args: vec!["-axo".to_string(), "ruid=,pid=".to_string()],
+            }]
+        );
+    }
+
+    #[test]
+    /// psアダプターがコマンド仕様と実行結果を保つ。
+    // why: PID列挙の実行失敗や出力欠落を、成功した空一覧と取り違えないため。
+    fn process_list_command_uses_expected_command_and_preserves_result() {
+        let output = b"501 101\n".to_vec();
+        let runner = FakeProcessCommandRunner::new(Some((false, output.clone())));
+
+        let result = run_process_list_command(&runner, Instant::now(), None);
+
+        assert_eq!(result, Some((false, output)));
+        assert_eq!(
+            *runner.commands.borrow(),
+            vec![RecordedCommand {
+                program: "ps".to_string(),
+                args: vec!["-axo".to_string(), "ruid=,pid=".to_string()],
+            }]
+        );
+    }
+
+    #[test]
+    /// footprintアダプターがPIDごとの引数と実行結果を保つ。
+    // why: 対象PIDや物理フットプリント形式を誤って要求・破棄しないため。
+    fn footprint_command_uses_expected_command_and_preserves_result() {
+        let output = b"Example [12]: phys_footprint: 1,024 bytes\n".to_vec();
+        let runner = FakeProcessCommandRunner::new(Some((true, output.clone())));
+
+        let result = run_footprint_command(&runner, &[12, 34], Instant::now(), None);
+
+        assert_eq!(result, Some((true, output)));
+        assert_eq!(
+            *runner.commands.borrow(),
+            vec![RecordedCommand {
+                program: "footprint".to_string(),
+                args: vec![
+                    "--noCategories".to_string(),
+                    "--format".to_string(),
+                    "bytes".to_string(),
+                    "--pid".to_string(),
+                    "12".to_string(),
+                    "--pid".to_string(),
+                    "34".to_string(),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    /// current_real_uidがOSの返す実ユーザーIDを返す。
+    // why: 別ユーザーのPIDを除外する入口で、固定値を使って誤ったプロセス集合にしないため。
+    fn current_real_uid_matches_system_real_uid() {
+        let output = Command::new("/usr/bin/id")
+            .args(["-ru"])
+            .output()
+            .expect("macOS id command should be available");
+        assert!(output.status.success());
+        let expected = String::from_utf8(output.stdout)
+            .expect("id output should be UTF-8")
+            .trim()
+            .parse::<u32>()
+            .expect("id should print a numeric real UID");
+
+        assert_eq!(current_real_uid(), expected);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    /// macOS APIから現在のテストプロセスの実行ファイルパスを取得する。
+    // why: プロセスをアプリへ正しく紐付けるため、取得不能や空のパスを見逃さないようにする。
+    fn current_process_executable_path_is_absolute() {
+        let path = process_executable_path(std::process::id())
+            .expect("macOS should report the current process executable path");
+
+        assert!(Path::new(&path).is_absolute(), "unexpected path: {path}");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    /// macOS APIから現在のテストプロセスの開始時刻とenergy値を取得する。
+    // why: energy計測でPID再利用を判別する開始時刻が、実測値として取得できることを確認するため。
+    fn current_process_energy_usage_has_start_time() {
+        let (started_at, _energy_nj) = process_energy_usage(std::process::id())
+            .expect("macOS should report resource usage for the current process");
+
+        assert!(
+            started_at > 1,
+            "process start absolute time should be a real, nontrivial value"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    /// Foundationが既存ファイルのFinder表示名を返す。
+    // why: Objective-C呼び出しの戻り値がアプリ表示名の取得まで届くことを確認するため。
+    fn foundation_returns_display_name_for_existing_file() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+
+        assert_eq!(
+            file_manager_display_name(&path).as_deref(),
+            Some("Cargo.toml")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    /// Objective-CオブジェクトのどちらかがNULLなら後続の呼び出しを中断する。
+    // why: 片方だけが取得できない場合にNULLをObjective-Cへ渡さないため。
+    fn detects_missing_object_in_objc_pairs() {
+        let marker = 0_u8;
+        let object = &marker as *const u8 as *mut std::ffi::c_void;
+        let null = std::ptr::null_mut();
+
+        assert!(!either_objc_object_is_null(object, object));
+        assert!(either_objc_object_is_null(null, object));
+        assert!(either_objc_object_is_null(object, null));
+        assert!(either_objc_object_is_null(null, null));
+    }
+
+    #[test]
     /// メモリ取得の時間切れ後もenergy取得には独立した時間枠を与える。
     // why: footprintの遅延だけでenergyカウンターの取得機会を失わないため。
     fn popup_energy_scan_gets_a_fresh_deadline_after_memory_times_out() {
+        let timeout = Duration::from_millis(30);
+        let earliest_deadline = Instant::now() + timeout;
         let scanned = scan_popup_sources_with_independent_deadlines(
             &[123],
             None,
-            Duration::from_millis(30),
+            timeout,
             |_, deadline, _| {
+                assert!(deadline >= earliest_deadline);
                 while Instant::now() <= deadline {
                     std::thread::yield_now();
                 }
@@ -806,6 +1168,28 @@ mod tests {
         assert_eq!(
             parse_phys_footprint("phys_footprint: 1,712 KB\n"),
             Some(1_753_088)
+        );
+    }
+
+    #[test]
+    /// MB・GBのfootprint値をバイト数へ変換し、桁あふれは取得不能にする。
+    // why: 大きなプロセスのメモリ量を誤換算したり、overflow後の値を表示したりしないため。
+    fn parses_megabytes_and_gigabytes_as_bytes() {
+        assert_eq!(
+            parse_phys_footprint("phys_footprint: 1 MB\n"),
+            Some(1_048_576)
+        );
+        assert_eq!(
+            parse_phys_footprint("phys_footprint: 1 GB\n"),
+            Some(1_073_741_824)
+        );
+        assert_eq!(
+            parse_phys_footprint(&format!("phys_footprint: {} MB\n", u64::MAX)),
+            None
+        );
+        assert_eq!(
+            parse_phys_footprint(&format!("phys_footprint: {} GB\n", u64::MAX)),
+            None
         );
     }
 
@@ -863,6 +1247,72 @@ Auxiliary data:
     }
 
     #[test]
+    /// process listから現在UIDのPIDだけ選び、独立した2種類のscanへ渡す。
+    // why: 他ユーザーのプロセスを混ぜず、memory・energy両方の取得を継続するため。
+    fn popup_process_scan_filters_uid_and_runs_both_sources() {
+        let timeout = Duration::from_secs(3);
+        let earliest_deadline = Instant::now() + timeout;
+        let scanned = scan_popup_processes_with(
+            None,
+            timeout,
+            |deadline, _| {
+                assert!(deadline >= earliest_deadline);
+                Some((true, b"501 101\n502 202\n".to_vec()))
+            },
+            || 501,
+            |pids, _, _| {
+                assert_eq!(pids, [101]);
+                Some(vec![MemoryConsumer {
+                    name: "Example".to_string(),
+                    bytes: 1_024,
+                    process_count: 1,
+                }])
+            },
+            |pids, _, _| {
+                assert_eq!(pids, [101]);
+                Some(Vec::new())
+            },
+        )
+        .expect("successful process listing should produce a scan");
+
+        assert_eq!(
+            scanned.memory,
+            Some(vec![MemoryConsumer {
+                name: "Example".to_string(),
+                bytes: 1_024,
+                process_count: 1,
+            }])
+        );
+        assert_eq!(scanned.energy, Some(Vec::new()));
+    }
+
+    #[test]
+    /// process listの起動失敗や異常終了は空スキャンとして扱わない。
+    // why: プロセス一覧取得に失敗した状態を「対象PIDなし」と誤認しないため。
+    fn popup_process_scan_stops_when_process_listing_fails() {
+        let timeout = Duration::from_secs(1);
+        let unavailable = scan_popup_processes_with(
+            None,
+            timeout,
+            |_, _| None::<(bool, Vec<u8>)>,
+            || panic!("UID is not needed when process listing is unavailable"),
+            |_, _, _| panic!("scans must not run when process listing is unavailable"),
+            |_, _, _| panic!("scans must not run when process listing is unavailable"),
+        );
+        assert!(unavailable.is_none());
+
+        let unsuccessful = scan_popup_processes_with(
+            None,
+            timeout,
+            |_, _| Some((false, Vec::new())),
+            || panic!("UID is not needed when process listing fails"),
+            |_, _, _| panic!("scans must not run when process listing fails"),
+            |_, _, _| panic!("scans must not run when process listing fails"),
+        );
+        assert!(unsuccessful.is_none());
+    }
+
+    #[test]
     /// アプリバンドル外のシステムプロセスとコマンドを区別して表示する。
     // why: アプリ外の項目をアプリと誤認しないため。
     fn labels_unbundled_system_and_command_processes() {
@@ -881,6 +1331,114 @@ Auxiliary data:
     }
 
     #[test]
+    /// process pathに従ってアプリhelperを同じbundleへ分類し、bundle外は名前付けする。
+    // why: メモリ集計前にPIDごとの実行ファイル情報を正しく反映するため。
+    fn attributes_processes_from_resolved_paths() {
+        let mut processes = vec![
+            ProcessMemory {
+                pid: 10,
+                name: "Example".to_string(),
+                bytes: 100,
+                application: None,
+            },
+            ProcessMemory {
+                pid: 11,
+                name: "Example Helper".to_string(),
+                bytes: 200,
+                application: None,
+            },
+            ProcessMemory {
+                pid: 12,
+                name: "WindowServer".to_string(),
+                bytes: 300,
+                application: None,
+            },
+        ];
+
+        attribute_processes(
+            &mut processes,
+            |pid| match pid {
+                10 => Some("/Applications/Example.app/Contents/MacOS/Example".to_string()),
+                11 => Some("/Applications/Example.app/Contents/Helpers/Example Helper".to_string()),
+                12 => Some("/System/Library/WindowServer".to_string()),
+                _ => None,
+            },
+            |_| "Example Display".to_string(),
+        );
+
+        assert_eq!(
+            processes,
+            vec![
+                ProcessMemory {
+                    pid: 10,
+                    name: "Example".to_string(),
+                    bytes: 100,
+                    application: Some(AppBundle {
+                        path: PathBuf::from("/Applications/Example.app"),
+                        name: "Example Display".to_string(),
+                    }),
+                },
+                ProcessMemory {
+                    pid: 11,
+                    name: "Example Helper".to_string(),
+                    bytes: 200,
+                    application: Some(AppBundle {
+                        path: PathBuf::from("/Applications/Example.app"),
+                        name: "Example Display".to_string(),
+                    }),
+                },
+                ProcessMemory {
+                    pid: 12,
+                    name: "macOS · WindowServer (PID 12)".to_string(),
+                    bytes: 300,
+                    application: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    /// memory scanは空PIDを空結果にし、失敗時も解析済みの部分結果を保つ。
+    // why: 対象なし・完全失敗・部分的な取得成功を正しく区別するため。
+    fn memory_scan_distinguishes_empty_failed_and_partial_results() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let empty = scan_memory_top_three(
+            &[],
+            deadline,
+            None,
+            |_, _, _| panic!("empty scan must not start footprint"),
+            |_| panic!("empty scan must not attribute processes"),
+        );
+        assert_eq!(empty, Some(Vec::new()));
+
+        let failed = scan_memory_top_three(
+            &[10],
+            deadline,
+            None,
+            |_, _, _| Some((false, Vec::new())),
+            |_| panic!("failed output must not contain processes"),
+        );
+        assert_eq!(failed, None);
+
+        let output = b"Example [10]: 64-bit Footprint: 1,024 bytes\nphys_footprint: 1,024\n";
+        let partial = scan_memory_top_three(
+            &[10],
+            deadline,
+            None,
+            |_, _, _| Some((false, output.to_vec())),
+            |_| {},
+        );
+        assert_eq!(
+            partial,
+            Some(vec![MemoryConsumer {
+                name: "Example".to_string(),
+                bytes: 1_024,
+                process_count: 1,
+            }])
+        );
+    }
+
+    #[test]
     /// アプリバンドルの表示名から`.app`拡張子を取り除く。
     // why: 画面上のアプリ名に不要な拡張子を出さないため。
     fn application_display_name_omits_app_extension() {
@@ -888,6 +1446,20 @@ Auxiliary data:
             display_name_for_bundle(Path::new("/Applications/Example App.app")),
             "Example App"
         );
+    }
+
+    #[test]
+    /// OSの表示名が拡張子だけならbundle名へフォールバックする。
+    // why: 空の表示名をアプリ名として表示しないため。
+    fn bundle_display_name_falls_back_from_empty_os_name() {
+        assert_eq!(
+            bundle_display_name(
+                Path::new("/Applications/Example App.app"),
+                Some(".app".to_string()),
+            ),
+            "Example App"
+        );
+        assert_eq!(bundle_display_name(Path::new(""), None), "Unknown app");
     }
 
     #[test]
@@ -1097,6 +1669,104 @@ Auxiliary data:
     }
 
     #[test]
+    /// process energy scanは注入された取得値でアプリ情報と個別プロセス名を作る。
+    // why: OSのプロセス情報を使わず、取得成功・失敗と名前付けの契約を再現するため。
+    fn process_energy_scan_uses_injected_data_and_skips_unavailable_processes() {
+        let samples = scan_process_energy(
+            &[10, 20, 30],
+            Instant::now() + Duration::from_secs(1),
+            None,
+            |pid| match pid {
+                10 => Some((100, 200)),
+                20 => Some((200, 300)),
+                _ => None,
+            },
+            |pid| match pid {
+                10 => Some("/Applications/Example.app/Contents/MacOS/Example".to_string()),
+                20 => Some("/usr/local/bin/helper".to_string()),
+                _ => None,
+            },
+            |_| "Example Display".to_string(),
+        )
+        .expect("available energy samples should be returned");
+
+        assert_eq!(
+            samples,
+            vec![
+                ProcessEnergySample {
+                    pid: 10,
+                    started_at: 100,
+                    energy_nj: 200,
+                    name: "Example Display".to_string(),
+                    application: Some(AppBundle {
+                        path: PathBuf::from("/Applications/Example.app"),
+                        name: "Example Display".to_string(),
+                    }),
+                },
+                ProcessEnergySample {
+                    pid: 20,
+                    started_at: 200,
+                    energy_nj: 300,
+                    name: "Process · helper (PID 20)".to_string(),
+                    application: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    /// キャンセルまたは期限切れならOS情報を読まずenergy scanを中断する。
+    // why: popupが閉じた後や予算時間を過ぎた後に追加のプロセス取得を始めないため。
+    fn process_energy_scan_stops_before_reading_when_cancelled_or_expired() {
+        let cancelled = AtomicBool::new(false);
+        let cancelled_result = scan_process_energy(
+            &[10],
+            Instant::now() + Duration::from_secs(1),
+            Some(&cancelled),
+            |_| panic!("cancelled scan must not query energy"),
+            |_| panic!("cancelled scan must not query path"),
+            |_| panic!("cancelled scan must not resolve display names"),
+        );
+        assert!(cancelled_result.is_none());
+
+        let expired_result = scan_process_energy(
+            &[10],
+            Instant::now() - Duration::from_millis(1),
+            None,
+            |_| panic!("expired scan must not query energy"),
+            |_| panic!("expired scan must not query path"),
+            |_| panic!("expired scan must not resolve display names"),
+        );
+        assert!(expired_result.is_none());
+    }
+
+    #[test]
+    /// PID一覧が空なら空の成功結果、値が全て取得不能ならNoneを返す。
+    // why: 「対象プロセスなし」と「energy取得失敗」を同じ状態に潰さないため。
+    fn process_energy_scan_distinguishes_empty_from_unavailable_results() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let empty = scan_process_energy(
+            &[],
+            deadline,
+            None,
+            |_| panic!("empty scan must not query energy"),
+            |_| panic!("empty scan must not query path"),
+            |_| panic!("empty scan must not resolve display names"),
+        );
+        assert_eq!(empty, Some(Vec::new()));
+
+        let unavailable = scan_process_energy(
+            &[10],
+            deadline,
+            None,
+            |_| None,
+            |_| panic!("unavailable energy must skip path lookup"),
+            |_| panic!("unavailable energy must skip display names"),
+        );
+        assert_eq!(unavailable, None);
+    }
+
+    #[test]
     /// プロセスの入れ替わりで結果が空になってもpanicしない。
     // why: プロセスの入れ替わりで取得項目がなくてもpanicしないため。
     fn process_churn_can_produce_empty_result_without_panicking() {
@@ -1133,5 +1803,112 @@ Auxiliary data:
             !stderr.contains(DIAGNOSTIC),
             "child diagnostics must not reach the popup: {stderr}"
         );
+    }
+
+    #[test]
+    /// 子プロセスの終了状態と標準出力を取得する。
+    // why: 正常終了と異常終了の結果を呼び出し元が判定できるようにするため。
+    fn wait_for_child_returns_output_and_exit_status() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "printf partial; exit 7"])
+            .stdout(Stdio::piped());
+
+        let result = SystemProcessCommandRunner
+            .run(command, Instant::now() + Duration::from_secs(1), None)
+            .expect("child result must be available");
+
+        assert_eq!(result, (false, b"partial".to_vec()));
+    }
+
+    #[test]
+    /// キャンセル済みなら終了期限前でも子プロセスの結果を待たず中断する。
+    // why: popupを閉じた後に補助プロセスを走らせ続けないため。
+    fn wait_for_child_stops_when_cancelled() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 0.2"]).stdout(Stdio::piped());
+        let child = spawn_with_suppressed_stderr(command).expect("child must start");
+        let cancelled = AtomicBool::new(false);
+
+        assert!(wait_for_child(
+            child,
+            Instant::now() + Duration::from_secs(1),
+            Some(&cancelled),
+        )
+        .is_none());
+    }
+
+    #[test]
+    /// deadlineを過ぎた子プロセスを待ち続けずタイムアウトにする。
+    // why: 遅い補助コマンドがpopupの応答を止めないようにするため。
+    fn wait_for_child_stops_after_deadline() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 0.2"]).stdout(Stdio::piped());
+        let child = spawn_with_suppressed_stderr(command).expect("child must start");
+
+        assert!(wait_for_child(child, Instant::now() - Duration::from_millis(1), None,).is_none());
+    }
+
+    #[test]
+    /// stdoutの読み取りは空き状態を許容し、データを蓄積し、その他のエラーを返す。
+    // why: 非ブロッキングpipeの一時的なWouldBlockと実際の読み取り失敗を区別するため。
+    fn drain_available_handles_data_and_read_errors() {
+        struct ErrorReader(io::ErrorKind);
+
+        impl Read for ErrorReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from(self.0))
+            }
+        }
+
+        let mut output = Vec::new();
+        assert!(drain_available(&mut io::Cursor::new(b"result"), &mut output).is_ok());
+        assert_eq!(output, b"result");
+
+        let mut would_block = ErrorReader(io::ErrorKind::WouldBlock);
+        assert!(drain_available(&mut would_block, &mut output).is_ok());
+
+        let mut permission_denied = ErrorReader(io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            drain_available(&mut permission_denied, &mut output)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    /// stdoutのfile descriptorへO_NONBLOCKを設定する。
+    // why: 待機中の子プロセスから読み込む際にreadでpopupを停止させないため。
+    fn set_nonblocking_sets_descriptor_flag() {
+        unsafe extern "C" {
+            fn fcntl(fd: i32, command: i32, ...) -> i32;
+        }
+
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open("/dev/null")
+            .expect("/dev/null must be writable");
+        let fd = file.as_raw_fd();
+        let first_result = set_nonblocking(fd);
+        let second_result = set_nonblocking(fd);
+        // SAFETY: file remains open and is owned by this test while the flags are read.
+        let flags = unsafe { fcntl(fd, 3) };
+
+        assert!(first_result.is_ok());
+        assert!(second_result.is_ok());
+        assert_ne!(flags & 0x0004, 0);
+        assert_ne!(flags & 0x0008, 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    /// F_SETFLの失敗をエラーとして返す。
+    // why: 非ブロッキング化できないstdoutをblocking readへ渡して待ち続けないため。
+    fn set_nonblocking_reports_flag_update_failure() {
+        let result = set_nonblocking_with(42, |_| 0, |_, _| -1);
+
+        assert!(result.is_err());
     }
 }

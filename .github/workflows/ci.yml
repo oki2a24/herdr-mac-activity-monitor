@@ -8,17 +8,18 @@ on:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    name: Verify (macOS)
+    runs-on: macos-latest
     steps:
-       - uses: actions/checkout@v4
-       - name: Install Rust toolchain
-         uses: dtolnay/rust-toolchain@stable
-         with:
-           components: rustfmt, clippy
-       - name: Cache
-         uses: Swatinem/rust-cache@v2
-       - name: Verify
-         run: make verify
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+      - name: Verify
+        run: make verify
 
   audit:
     runs-on: ubuntu-latest
@@ -27,9 +28,6 @@ jobs:
        - name: Install Rust toolchain
          uses: dtolnay/rust-toolchain@stable
        - name: Install cargo-audit
-         uses: cargo-bins/cargo-binstall@main
-         with:
-           name: cargo-audit
-           args: --no-track
+         run: cargo install cargo-audit --locked
        - name: Security audit
          run: make audit

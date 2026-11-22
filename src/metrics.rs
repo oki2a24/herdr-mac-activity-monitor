@@ -151,6 +151,7 @@ impl ProcessScanner {
         let (results, result_receiver) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(true));
         let worker_cancel = Arc::clone(&cancel);
+        let command_runner = crate::processes::SystemProcessCommandRunner;
         let mut energy_sampler = EnergySampler::default();
         // 全processのfootprint snapshotは時間がかかるため、
         // TUIの描画スレッドとは分離してpopupの入力応答を止めない。
@@ -160,14 +161,13 @@ impl ProcessScanner {
                     break;
                 }
                 let scanned =
-                    crate::processes::scan_popup_processes(Some(&worker_cancel)).map(|scan| {
-                        ScannedProcessMetrics {
+                    crate::processes::scan_popup_processes(Some(&worker_cancel), &command_runner)
+                        .map(|scan| ScannedProcessMetrics {
                             memory: scan.memory,
                             energy: scan
                                 .energy
                                 .map(|samples| energy_sampler.update(Instant::now(), samples)),
-                        }
-                    });
+                        });
                 if results.send(scanned).is_err() {
                     break;
                 }
@@ -270,18 +270,23 @@ impl CpuSampler {
         let Some(previous) = previous else {
             return CpuUtilization::Unavailable;
         };
-        let wall_elapsed = wall_now.duration_since(previous.wall_at).ok();
         // Instantだけではスリープ復帰後の経過を表現できる環境差があるため、
         // wall clockも併用し、長い中断をCPU使用率として誤表示しない。
-        if now.duration_since(previous.at) > Duration::from_secs(5)
-            || wall_elapsed.is_none_or(|elapsed| elapsed > Duration::from_secs(5))
-        {
+        if cpu_sample_is_stale(previous, now, wall_now) {
             return CpuUtilization::Unavailable;
         }
         calculate_cpu_utilization(previous.ticks, current)
             .map(CpuUtilization::Percent)
             .unwrap_or(CpuUtilization::Unavailable)
     }
+}
+
+fn cpu_sample_is_stale(previous: CpuSample, now: Instant, wall_now: SystemTime) -> bool {
+    now.duration_since(previous.at) > Duration::from_secs(5)
+        || wall_now
+            .duration_since(previous.wall_at)
+            .ok()
+            .is_none_or(|elapsed| elapsed > Duration::from_secs(5))
 }
 
 fn calculate_cpu_utilization(previous: CpuTicks, current: CpuTicks) -> Option<f64> {
@@ -347,7 +352,7 @@ fn read_cpu_ticks() -> Result<CpuTicks, String> {
             &mut info_count,
         )
     };
-    if result != 0 || info.is_null() {
+    if cpu_info_query_failed(result, info.is_null()) {
         return Err(format!("host_processor_info failed: {result}"));
     }
 
@@ -357,7 +362,9 @@ fn read_cpu_ticks() -> Result<CpuTicks, String> {
     let mut idle = 0_u64;
     let mut nice = 0_u64;
     for cpu in values
-        .chunks_exact(CPU_STATE_MAX)
+        .as_chunks::<CPU_STATE_MAX>()
+        .0
+        .iter()
         .take(processor_count as usize)
     {
         user = user.saturating_add(u64::try_from(cpu[CPU_STATE_USER]).unwrap_or(0));
@@ -372,7 +379,7 @@ fn read_cpu_ticks() -> Result<CpuTicks, String> {
         vm_deallocate(
             mach_task_self(),
             info.cast::<u8>() as usize,
-            info_count as usize * std::mem::size_of::<Integer>(),
+            cpu_info_buffer_size(info_count as usize),
         );
     }
     let busy = user.saturating_add(system).saturating_add(nice);
@@ -380,6 +387,15 @@ fn read_cpu_ticks() -> Result<CpuTicks, String> {
         busy,
         total: busy.saturating_add(idle),
     })
+}
+
+#[cfg(target_os = "macos")]
+fn cpu_info_buffer_size(info_count: usize) -> usize {
+    info_count * std::mem::size_of::<Integer>()
+}
+
+fn cpu_info_query_failed(result: i32, info_is_null: bool) -> bool {
+    result != 0 || info_is_null
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -429,13 +445,17 @@ fn get_swap_usage() -> Result<SwapUsage, String> {
             0,
         )
     };
-    if result != 0 || length < std::mem::size_of::<XswUsage>() {
+    if swap_usage_query_failed(result, length, std::mem::size_of::<XswUsage>()) {
         return Err("sysctl vm.swapusage failed".to_string());
     }
     Ok(SwapUsage {
         used_bytes: usage.used,
         total_bytes: usage.total,
     })
+}
+
+fn swap_usage_query_failed(result: i32, length: usize, required_length: usize) -> bool {
+    result != 0 || length < required_length
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -490,6 +510,10 @@ fn get_thermal_state() -> ThermalState {
             std::mem::transmute(objc_msgSend as *const ());
         send(info, sel_registerName(thermal_name.as_ptr()))
     };
+    thermal_state_from_code(state)
+}
+
+fn thermal_state_from_code(state: isize) -> ThermalState {
     match state {
         0 => ThermalState::Nominal,
         1 => ThermalState::Fair,
@@ -546,6 +570,15 @@ unsafe extern "C" {
 }
 
 #[cfg(target_os = "macos")]
+unsafe fn cancel_and_release_dispatch_source(source: DispatchSource) {
+    // SAFETY: 呼び出し元が有効なdispatch sourceだけを渡す。
+    unsafe {
+        dispatch_source_cancel(source);
+        dispatch_release(source);
+    }
+}
+
+#[cfg(target_os = "macos")]
 struct PressureContext {
     source: std::sync::atomic::AtomicPtr<std::ffi::c_void>,
     state: std::sync::atomic::AtomicU8,
@@ -556,6 +589,8 @@ struct MemoryPressureMonitor {
     source: DispatchSource,
     #[cfg(target_os = "macos")]
     context: *mut PressureContext,
+    #[cfg(target_os = "macos")]
+    cancel_and_release: unsafe fn(DispatchSource),
 }
 
 impl MemoryPressureMonitor {
@@ -588,7 +623,11 @@ impl MemoryPressureMonitor {
                     );
                     dispatch_resume(source);
                 }
-                return Self { source, context };
+                return Self {
+                    source,
+                    context,
+                    cancel_and_release: cancel_and_release_dispatch_source,
+                };
             }
         }
         // macOS以外、または通知源作成に失敗した場合は、collector全体を止めずに
@@ -598,6 +637,8 @@ impl MemoryPressureMonitor {
             source: std::ptr::null_mut(),
             #[cfg(target_os = "macos")]
             context: std::ptr::null_mut(),
+            #[cfg(target_os = "macos")]
+            cancel_and_release: cancel_and_release_dispatch_source,
         }
     }
 
@@ -665,10 +706,7 @@ impl Drop for MemoryPressureMonitor {
         }
         // SAFETY: The cancellation handler reclaims the context after outstanding event handlers
         // complete. Releasing the source here only drops the dispatch object itself.
-        unsafe {
-            dispatch_source_cancel(self.source);
-            dispatch_release(self.source);
-        }
+        unsafe { (self.cancel_and_release)(self.source) };
     }
 }
 
@@ -844,6 +882,16 @@ pub fn format_popup_lines(snapshot: &PopupSnapshot) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    static MEMORY_PRESSURE_DROP_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    #[cfg(target_os = "macos")]
+    unsafe fn record_memory_pressure_drop(source: DispatchSource) {
+        assert!(!source.is_null());
+        MEMORY_PRESSURE_DROP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     use crate::{
         parsers::{Battery, ChargingState, MemInfo},
         processes::EnergyConsumer,
@@ -909,6 +957,98 @@ mod tests {
             ),
             Some(30.0)
         );
+    }
+
+    #[test]
+    /// CPU標本は両方の時計が5秒以内なら有効とし、どちらかが超えれば無効にする。
+    // why: スリープ復帰などで古くなったCPU標本から使用率を誤表示しないため。
+    fn cpu_sample_age_checks_monotonic_and_wall_clocks() {
+        let now = Instant::now();
+        let wall_now = SystemTime::now();
+        let ticks = CpuTicks { busy: 1, total: 2 };
+        let at_boundary = CpuSample {
+            ticks,
+            at: now - Duration::from_secs(5),
+            wall_at: wall_now - Duration::from_secs(5),
+        };
+        let stale_monotonic = CpuSample {
+            at: now - Duration::from_secs(6),
+            wall_at: wall_now - Duration::from_secs(1),
+            ..at_boundary
+        };
+        let stale_wall = CpuSample {
+            at: now - Duration::from_secs(1),
+            wall_at: wall_now - Duration::from_secs(6),
+            ..at_boundary
+        };
+
+        assert!(!cpu_sample_is_stale(at_boundary, now, wall_now));
+        assert!(cpu_sample_is_stale(stale_monotonic, now, wall_now));
+        assert!(cpu_sample_is_stale(stale_wall, now, wall_now));
+    }
+
+    #[test]
+    /// busy時間が合計時間と同じ差分なら100%使用率として扱う。
+    // why: CPUが全期間busyだった境界値を無効な標本として捨てないため。
+    fn cpu_delta_accepts_a_fully_busy_interval() {
+        assert_eq!(
+            calculate_cpu_utilization(
+                CpuTicks {
+                    busy: 10,
+                    total: 20
+                },
+                CpuTicks {
+                    busy: 30,
+                    total: 40
+                },
+            ),
+            Some(100.0)
+        );
+    }
+
+    #[test]
+    /// Mach CPU情報の成功・失敗とバッファ有無を正しく判定する。
+    // why: 失敗応答やnullバッファを有効なCPU標本として読み取らないため。
+    fn cpu_info_validation_requires_success_and_a_buffer() {
+        assert!(cpu_info_query_failed(-1, false));
+        assert!(cpu_info_query_failed(0, true));
+        assert!(!cpu_info_query_failed(0, false));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    /// Mach CPU情報の要素数を解放時に必要なバイト数へ変換する。
+    // why: 要素数のまま解放せず、返却バッファ全体のメモリを回収するため。
+    fn cpu_info_buffer_size_counts_bytes() {
+        assert_eq!(cpu_info_buffer_size(3), 12);
+    }
+
+    #[test]
+    /// swap情報の戻り値とバッファ長を両方検証する。
+    // why: sysctl失敗や短いバッファを正常なswap値として扱わないため。
+    fn swap_usage_validation_checks_status_and_buffer_length() {
+        assert!(swap_usage_query_failed(-1, 8, 8));
+        assert!(swap_usage_query_failed(0, 7, 8));
+        assert!(!swap_usage_query_failed(0, 8, 8));
+        assert!(!swap_usage_query_failed(0, 9, 8));
+    }
+
+    #[test]
+    /// thermal stateの既知コードと未知コードを状態へ変換する。
+    // why: OSの数値コードを誤った温度状態として表示しないため。
+    fn thermal_state_maps_known_and_unknown_codes() {
+        let cases = [
+            (0, ThermalState::Nominal),
+            (1, ThermalState::Fair),
+            (2, ThermalState::Serious),
+            (3, ThermalState::Critical),
+            (-1, ThermalState::Unavailable),
+            (4, ThermalState::Unavailable),
+        ];
+
+        for (code, expected) in cases {
+            assert_eq!(thermal_state_from_code(code), expected);
+        }
     }
 
     #[test]
@@ -1005,6 +1145,51 @@ mod tests {
     }
 
     #[test]
+    /// 電力表示でゼロと0.1 mWの境界を小数値として区別する。
+    // why: 実測ゼロや境界値を「0.1 mW未満」と誤分類しないため。
+    fn milliwatt_format_preserves_zero_and_threshold_values() {
+        assert_eq!(format_milliwatts(0.0), "0.0 mW");
+        assert_eq!(format_milliwatts(0.1), "0.1 mW");
+    }
+
+    #[test]
+    /// 残り時間表示を60分の境界で分表示から時分表示へ切り替える。
+    // why: 1時間未満を1時間表示にしたり、1時間を分表示にしたりしないため。
+    fn runtime_format_changes_units_at_one_hour() {
+        assert_eq!(
+            format_runtime(&battery::RuntimeEstimate::Seconds(3_599)),
+            "59m"
+        );
+        assert_eq!(
+            format_runtime(&battery::RuntimeEstimate::Seconds(3_600)),
+            "1h 00m"
+        );
+    }
+
+    #[test]
+    /// プロセス名を省略してもPIDを残し、指定幅を超えない。
+    // why: 長い名前でも一覧の列幅とプロセス識別性を同時に保つため。
+    fn consumer_name_truncation_preserves_width_and_pid() {
+        let name = format!("Process · {} (PID 123456)", "a".repeat(64));
+        let displayed = truncate_consumer_name(&name, 32);
+
+        assert_eq!(displayed.chars().count(), 32);
+        assert!(displayed.ends_with("(PID 123456)"));
+    }
+
+    #[test]
+    /// 計測済みエネルギー一覧が空なら「計測可能な使用なし」と表示する。
+    // why: 空の正常結果を取得失敗や表示欠落と区別するため。
+    fn popup_reports_no_measurable_energy_for_empty_result() {
+        let mut value = snapshot();
+        value.energy_usage = EnergyUsage::Measured(Vec::new());
+
+        let lines = format_popup_lines(&value);
+
+        assert!(lines.iter().any(|line| line == "  no measurable use"));
+    }
+
+    #[test]
     /// 更新中も直近に取得した項目一覧を表示し続ける。
     // why: 更新に時間がかかる間も、表示中の一覧を消さないため。
     fn process_scanner_retains_latest_snapshot_while_refreshing() {
@@ -1032,6 +1217,49 @@ mod tests {
 
         assert_eq!(scanner.collect(), latest);
         assert_eq!(scanner.energy_usage(), latest_energy);
+    }
+
+    #[test]
+    /// 取得中でないProcessScannerは次の取得要求を送る。
+    // why: 更新完了後に新しいスナップショットの取得を再開するため。
+    fn process_scanner_requests_refresh_when_idle() {
+        let (request, requests) = mpsc::channel();
+        let (_result_sender, results) = mpsc::channel();
+        let mut scanner = ProcessScanner {
+            request: Some(request),
+            results,
+            cancel: Arc::new(AtomicBool::new(true)),
+            worker: None,
+            latest: Vec::new(),
+            latest_energy: EnergyUsage::Unavailable,
+            in_flight: false,
+        };
+
+        assert!(scanner.collect().is_empty());
+        assert!(requests.try_recv().is_ok());
+        assert!(scanner.in_flight);
+    }
+
+    #[test]
+    /// ProcessScannerを破棄するとworkerへキャンセルを通知する。
+    // why: ポップアップ終了後にバックグラウンド取得を残さないため。
+    fn process_scanner_cancels_worker_when_dropped() {
+        let cancel = Arc::new(AtomicBool::new(true));
+        let (request, _requests) = mpsc::channel();
+        let (_result_sender, results) = mpsc::channel();
+        let scanner = ProcessScanner {
+            request: Some(request),
+            results,
+            cancel: Arc::clone(&cancel),
+            worker: None,
+            latest: Vec::new(),
+            latest_energy: EnergyUsage::Unavailable,
+            in_flight: false,
+        };
+
+        drop(scanner);
+
+        assert!(!cancel.load(Ordering::Acquire));
     }
 
     #[test]
@@ -1105,6 +1333,71 @@ mod tests {
 
         assert!(row.ends_with("(PID 123456) — 3.00 GB"));
         assert!(!row.contains(&"a".repeat(64)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    /// dispatchの各メモリ圧力値を対応する状態へ変換する。
+    // why: 通知値ごとにNormal、Warn、Criticalを正しく表示するため。
+    fn memory_pressure_monitor_maps_dispatch_levels() {
+        let cases = [
+            (0, MemoryPressure::Unavailable),
+            (1, MemoryPressure::Normal),
+            (2, MemoryPressure::Warn),
+            (3, MemoryPressure::Critical),
+            (4, MemoryPressure::Unavailable),
+        ];
+
+        for (value, expected) in cases {
+            let context = Box::into_raw(Box::new(PressureContext {
+                source: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+                state: std::sync::atomic::AtomicU8::new(value),
+            }));
+            let monitor = MemoryPressureMonitor {
+                source: std::ptr::null_mut(),
+                context,
+                cancel_and_release: cancel_and_release_dispatch_source,
+            };
+
+            let actual = monitor.state();
+            drop(monitor);
+            // SAFETY: monitorのsourceはnullのためDropはcontextに触れず、テストが所有する箱を解放できる。
+            unsafe { drop(Box::from_raw(context)) };
+
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    /// 有効な通知源の破棄時にキャンセル・解放処理を呼び、NULLなら呼ばない。
+    // why: 通知源の解放漏れを防ぎ、作成に失敗したNULL通知源を誤って解放しないため。
+    fn memory_pressure_monitor_drop_cleans_up_active_source() {
+        MEMORY_PRESSURE_DROP_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let null_source_monitor = MemoryPressureMonitor {
+            source: std::ptr::null_mut(),
+            context: std::ptr::null_mut(),
+            cancel_and_release: record_memory_pressure_drop,
+        };
+        drop(null_source_monitor);
+        assert_eq!(
+            MEMORY_PRESSURE_DROP_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+
+        let marker = 0_u8;
+        let source = &marker as *const u8 as DispatchSource;
+        let active_source_monitor = MemoryPressureMonitor {
+            source,
+            context: std::ptr::null_mut(),
+            cancel_and_release: record_memory_pressure_drop,
+        };
+        drop(active_source_monitor);
+
+        assert_eq!(
+            MEMORY_PRESSURE_DROP_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]
