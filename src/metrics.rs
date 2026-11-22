@@ -151,6 +151,7 @@ impl ProcessScanner {
         let (results, result_receiver) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(true));
         let worker_cancel = Arc::clone(&cancel);
+        let command_runner = crate::processes::SystemProcessCommandRunner;
         let mut energy_sampler = EnergySampler::default();
         // 全processのfootprint snapshotは時間がかかるため、
         // TUIの描画スレッドとは分離してpopupの入力応答を止めない。
@@ -160,14 +161,13 @@ impl ProcessScanner {
                     break;
                 }
                 let scanned =
-                    crate::processes::scan_popup_processes(Some(&worker_cancel)).map(|scan| {
-                        ScannedProcessMetrics {
+                    crate::processes::scan_popup_processes(Some(&worker_cancel), &command_runner)
+                        .map(|scan| ScannedProcessMetrics {
                             memory: scan.memory,
                             energy: scan
                                 .energy
                                 .map(|samples| energy_sampler.update(Instant::now(), samples)),
-                        }
-                    });
+                        });
                 if results.send(scanned).is_err() {
                     break;
                 }

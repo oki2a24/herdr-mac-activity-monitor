@@ -11,6 +11,33 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// プロセス情報取得で使う補助コマンドの実行境界。
+pub(crate) trait ProcessCommandRunner {
+    /// コマンドを期限とキャンセル状態に従って実行し、終了状態と標準出力を返す。
+    fn run(
+        &self,
+        command: Command,
+        deadline: Instant,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<(bool, Vec<u8>)>;
+}
+
+/// OSの子プロセスを起動し、期限またはキャンセルまで待機する。
+pub(crate) struct SystemProcessCommandRunner;
+
+impl ProcessCommandRunner for SystemProcessCommandRunner {
+    fn run(
+        &self,
+        command: Command,
+        deadline: Instant,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<(bool, Vec<u8>)> {
+        let child = spawn_with_suppressed_stderr(command)?;
+        let (status, output) = wait_for_child(child, deadline, cancel)?;
+        Some((status.success(), output))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// アプリ、または個別プロセスのメモリ使用量。
 pub struct MemoryConsumer {
@@ -357,17 +384,28 @@ fn top_three(processes: Vec<ProcessMemory>) -> Vec<MemoryConsumer> {
 
 /// 現在のユーザーのPIDを一度列挙し、popup用memoryとenergyを取得する。
 /// PID列挙に失敗した場合は`None`を返す。高コストの取得はpopup workerから呼び出す。
-pub(crate) fn scan_popup_processes(cancel: Option<&AtomicBool>) -> Option<PopupProcessScan> {
+pub(crate) fn scan_popup_processes(
+    cancel: Option<&AtomicBool>,
+    command_runner: &dyn ProcessCommandRunner,
+) -> Option<PopupProcessScan> {
     const PROCESS_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
     scan_popup_processes_with(
         cancel,
         PROCESS_SCAN_TIMEOUT,
-        run_process_list_command,
+        |deadline, cancel| run_process_list_command(command_runner, deadline, cancel),
         current_real_uid,
         |pids, deadline, cancel| {
-            scan_memory_top_three(pids, deadline, cancel, run_footprint_command, |processes| {
-                attribute_processes(processes, process_executable_path, display_name_for_bundle)
-            })
+            scan_memory_top_three(
+                pids,
+                deadline,
+                cancel,
+                |pids, deadline, cancel| {
+                    run_footprint_command(command_runner, pids, deadline, cancel)
+                },
+                |processes| {
+                    attribute_processes(processes, process_executable_path, display_name_for_bundle)
+                },
+            )
         },
         |pids, deadline, cancel| {
             scan_process_energy(
@@ -412,6 +450,7 @@ where
 }
 
 fn run_process_list_command(
+    command_runner: &dyn ProcessCommandRunner,
     deadline: Instant,
     cancel: Option<&AtomicBool>,
 ) -> Option<(bool, Vec<u8>)> {
@@ -419,9 +458,7 @@ fn run_process_list_command(
     ps_command
         .args(["-axo", "ruid=,pid="])
         .stdout(Stdio::piped());
-    let ps_child = spawn_with_suppressed_stderr(ps_command)?;
-    let (ps_status, ps_output) = wait_for_child(ps_child, deadline, cancel)?;
-    Some((ps_status.success(), ps_output))
+    command_runner.run(ps_command, deadline, cancel)
 }
 
 fn scan_popup_sources_with_independent_deadlines<MemoryScan, EnergyScan>(
@@ -468,6 +505,7 @@ where
 }
 
 fn run_footprint_command(
+    command_runner: &dyn ProcessCommandRunner,
     pids: &[u32],
     deadline: Instant,
     cancel: Option<&AtomicBool>,
@@ -478,9 +516,7 @@ fn run_footprint_command(
         command.arg("--pid").arg(pid.to_string());
     }
     command.stdout(Stdio::piped());
-    let child = spawn_with_suppressed_stderr(command)?;
-    let (status, output) = wait_for_child(child, deadline, cancel)?;
-    Some((status.success(), output))
+    command_runner.run(command, deadline, cancel)
 }
 
 fn scan_process_energy<ReadEnergy, ResolvePath, DisplayName>(
@@ -823,8 +859,47 @@ fn set_nonblocking(fd: i32) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct RecordedCommand {
+        program: String,
+        args: Vec<String>,
+    }
+
+    struct FakeProcessCommandRunner {
+        result: Option<(bool, Vec<u8>)>,
+        commands: RefCell<Vec<RecordedCommand>>,
+    }
+
+    impl FakeProcessCommandRunner {
+        fn new(result: Option<(bool, Vec<u8>)>) -> Self {
+            Self {
+                result,
+                commands: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ProcessCommandRunner for FakeProcessCommandRunner {
+        fn run(
+            &self,
+            command: Command,
+            _deadline: Instant,
+            _cancel: Option<&AtomicBool>,
+        ) -> Option<(bool, Vec<u8>)> {
+            self.commands.borrow_mut().push(RecordedCommand {
+                program: command.get_program().to_string_lossy().into_owned(),
+                args: command
+                    .get_args()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect(),
+            });
+            self.result.clone()
+        }
+    }
 
     fn energy_sample(
         pid: u32,
@@ -842,6 +917,72 @@ mod tests {
                 name: application_name.to_string(),
             }),
         }
+    }
+
+    #[test]
+    /// popup用の本番入口が注入された実行役でPID一覧を取得する。
+    // why: 本番入口からコマンド境界までの配線を実機のプロセス一覧に依存せず確認するため。
+    fn popup_process_scan_uses_injected_command_runner() {
+        let runner = FakeProcessCommandRunner::new(Some((true, Vec::new())));
+
+        let scanned = scan_popup_processes(None, &runner)
+            .expect("a successful empty process listing should produce an empty scan");
+
+        assert_eq!(scanned.memory, Some(Vec::new()));
+        assert_eq!(scanned.energy, Some(Vec::new()));
+        assert_eq!(
+            *runner.commands.borrow(),
+            vec![RecordedCommand {
+                program: "ps".to_string(),
+                args: vec!["-axo".to_string(), "ruid=,pid=".to_string()],
+            }]
+        );
+    }
+
+    #[test]
+    /// psアダプターがコマンド仕様と実行結果を保つ。
+    // why: PID列挙の実行失敗や出力欠落を、成功した空一覧と取り違えないため。
+    fn process_list_command_uses_expected_command_and_preserves_result() {
+        let output = b"501 101\n".to_vec();
+        let runner = FakeProcessCommandRunner::new(Some((false, output.clone())));
+
+        let result = run_process_list_command(&runner, Instant::now(), None);
+
+        assert_eq!(result, Some((false, output)));
+        assert_eq!(
+            *runner.commands.borrow(),
+            vec![RecordedCommand {
+                program: "ps".to_string(),
+                args: vec!["-axo".to_string(), "ruid=,pid=".to_string()],
+            }]
+        );
+    }
+
+    #[test]
+    /// footprintアダプターがPIDごとの引数と実行結果を保つ。
+    // why: 対象PIDや物理フットプリント形式を誤って要求・破棄しないため。
+    fn footprint_command_uses_expected_command_and_preserves_result() {
+        let output = b"Example [12]: phys_footprint: 1,024 bytes\n".to_vec();
+        let runner = FakeProcessCommandRunner::new(Some((true, output.clone())));
+
+        let result = run_footprint_command(&runner, &[12, 34], Instant::now(), None);
+
+        assert_eq!(result, Some((true, output)));
+        assert_eq!(
+            *runner.commands.borrow(),
+            vec![RecordedCommand {
+                program: "footprint".to_string(),
+                args: vec![
+                    "--noCategories".to_string(),
+                    "--format".to_string(),
+                    "bytes".to_string(),
+                    "--pid".to_string(),
+                    "12".to_string(),
+                    "--pid".to_string(),
+                    "34".to_string(),
+                ],
+            }]
+        );
     }
 
     #[test]
@@ -1533,13 +1674,12 @@ Auxiliary data:
         command
             .args(["-c", "printf partial; exit 7"])
             .stdout(Stdio::piped());
-        let child = spawn_with_suppressed_stderr(command).expect("child must start");
 
-        let (status, output) = wait_for_child(child, Instant::now() + Duration::from_secs(1), None)
+        let result = SystemProcessCommandRunner
+            .run(command, Instant::now() + Duration::from_secs(1), None)
             .expect("child result must be available");
 
-        assert!(!status.success());
-        assert_eq!(output, b"partial");
+        assert_eq!(result, (false, b"partial".to_vec()));
     }
 
     #[test]
