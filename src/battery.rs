@@ -90,6 +90,14 @@ where
 }
 
 #[cfg(target_os = "macos")]
+fn with_cf_array_if_non_null<T, F>(array: CFArrayRef, read: F) -> Option<T>
+where
+    F: FnOnce(CFArrayRef) -> T,
+{
+    (!array.is_null()).then(|| read(array))
+}
+
+#[cfg(target_os = "macos")]
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFArrayGetCount(array: CFArrayRef) -> isize;
@@ -113,6 +121,16 @@ unsafe extern "C" {
     fn IOPSCopyPowerSourcesList(blob: CFTypeRef) -> CFArrayRef;
     fn IOPSGetPowerSourceDescription(blob: CFTypeRef, power_source: CFTypeRef) -> CFDictionaryRef;
     fn IOPSGetTimeRemainingEstimate() -> f64;
+}
+
+#[cfg(target_os = "macos")]
+fn release_cf_object_if_non_null_with<F>(value: CFTypeRef, release: F)
+where
+    F: FnOnce(CFTypeRef),
+{
+    if !value.is_null() {
+        release(value);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -196,9 +214,9 @@ fn get_snapshot_macos(include_runtime: bool) -> PowerSnapshot {
             .expect("static power source type")
             .as_c_str(),
     );
-    let sources = (!list.is_null()).then(|| {
+    let sources = with_cf_array_if_non_null(list, |list| {
         let count = unsafe { CFArrayGetCount(list) };
-        (0..count).map(|index| {
+        (0..count).map(move |index| {
             let source = unsafe { CFArrayGetValueAtIndex(list, index) };
             let dict = unsafe { IOPSGetPowerSourceDescription(info, source) };
             if dict.is_null() {
@@ -225,9 +243,10 @@ fn get_snapshot_macos(include_runtime: bool) -> PowerSnapshot {
         runtime: runtime_for_snapshot(include_runtime),
     };
 
-    if !list.is_null() {
-        unsafe { CFRelease(list) };
-    }
+    release_cf_object_if_non_null_with(list, |value| {
+        // SAFETY: `value` はIOKitから所有権付きで返された電源一覧。
+        unsafe { CFRelease(value) };
+    });
     unsafe { CFRelease(info) };
     result
 }
@@ -314,6 +333,70 @@ fn runtime_from_seconds(seconds: f64) -> RuntimeEstimate {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFDataCreate(allocator: CFTypeRef, bytes: *const u8, length: isize) -> CFTypeRef;
+        fn CFPropertyListCreateWithData(
+            allocator: CFTypeRef,
+            data: CFTypeRef,
+            options: u64,
+            format: *mut isize,
+            error: *mut CFTypeRef,
+        ) -> CFTypeRef;
+    }
+
+    #[cfg(target_os = "macos")]
+    struct OwnedCfObject(CFTypeRef);
+
+    #[cfg(target_os = "macos")]
+    impl Drop for OwnedCfObject {
+        fn drop(&mut self) {
+            // SAFETY: このラッパーはCreate APIが返した所有権付きオブジェクトを保持する。
+            unsafe { CFRelease(self.0) };
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn property_list_dictionary(entries: &str) -> OwnedCfObject {
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+             \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+             <plist version=\"1.0\"><dict>{entries}</dict></plist>"
+        );
+        // SAFETY: `xml` は呼び出し中有効なバイト列で、CFDataCreateが内容をコピーする。
+        let data = unsafe {
+            CFDataCreate(
+                std::ptr::null(),
+                xml.as_ptr(),
+                isize::try_from(xml.len()).expect("property list XML length fits CFIndex"),
+            )
+        };
+        assert!(
+            !data.is_null(),
+            "CFDataCreate should accept valid XML bytes"
+        );
+
+        // SAFETY: `data` は有効なCFDataであり、他の引数は任意出力を要求しない。
+        let property_list = unsafe {
+            CFPropertyListCreateWithData(
+                std::ptr::null(),
+                data,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        // SAFETY: このテストがCFDataCreateから得た所有権をここで手放す。
+        unsafe { CFRelease(data) };
+        assert!(
+            !property_list.is_null(),
+            "CoreFoundation should parse the test property list"
+        );
+        OwnedCfObject(property_list)
+    }
+
     #[test]
     /// macOS以外では、電源情報を取得できない状態として表す。
     // why: macOS以外で取得できない状態を、正常値やゼロと誤認しないため。
@@ -371,6 +454,77 @@ mod tests {
             })
         );
         assert_eq!(battery_from_fields(-1, false, false, true), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    /// CoreFoundation辞書の容量と充電中フラグを既存の状態へ変換する。
+    // why: CFNumberとCFBooleanの実値を読み、充電中の表示を維持するため。
+    fn reads_charging_battery_from_core_foundation_dictionary() {
+        let dictionary = property_list_dictionary(
+            "<key>Current Capacity</key><integer>81</integer>\
+             <key>Is Charging</key><true/>\
+             <key>Is Charged</key><false/>\
+             <key>Power Source State</key><string>Battery Power</string>",
+        );
+
+        assert_eq!(
+            battery_from_dictionary(dictionary.0 as CFDictionaryRef),
+            Some(Battery::Present {
+                percent: 81,
+                state: ChargingState::Charging,
+            })
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    /// バッテリー駆動とAC電源の文字列を区別して状態へ変換する。
+    // why: CFString比較の結果により放電中と充電完了を取り違えないため。
+    fn distinguishes_battery_power_from_ac_power_in_dictionary() {
+        let on_battery = property_list_dictionary(
+            "<key>Current Capacity</key><integer>45</integer>\
+             <key>Is Charging</key><false/>\
+             <key>Is Charged</key><false/>\
+             <key>Power Source State</key><string>Battery Power</string>",
+        );
+        let on_ac = property_list_dictionary(
+            "<key>Current Capacity</key><integer>45</integer>\
+             <key>Is Charging</key><false/>\
+             <key>Is Charged</key><false/>\
+             <key>Power Source State</key><string>AC Power</string>",
+        );
+
+        assert_eq!(
+            battery_from_dictionary(on_battery.0 as CFDictionaryRef),
+            Some(Battery::Present {
+                percent: 45,
+                state: ChargingState::Discharging,
+            })
+        );
+        assert_eq!(
+            battery_from_dictionary(on_ac.0 as CFDictionaryRef),
+            Some(Battery::Present {
+                percent: 45,
+                state: ChargingState::Charged,
+            })
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    /// 容量がない電源辞書を有効なバッテリー状態として扱わない。
+    // why: 必須情報が欠けたOSデータを誤った割合で表示しないため。
+    fn rejects_dictionary_without_current_capacity() {
+        let dictionary = property_list_dictionary(
+            "<key>Is Charging</key><true/>\
+             <key>Power Source State</key><string>Battery Power</string>",
+        );
+
+        assert_eq!(
+            battery_from_dictionary(dictionary.0 as CFDictionaryRef),
+            None
+        );
     }
 
     #[test]
@@ -478,6 +632,44 @@ mod tests {
 
         assert_eq!(battery, Battery::Absent);
         assert!(!read_called);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    /// NULLの配列は読み飛ばし、存在する配列だけ読み取り処理へ渡す。
+    // why: NULL配列の参照によるクラッシュと、実データの読み飛ばしを防ぐため。
+    fn reads_only_non_null_power_source_lists() {
+        let marker = 0_u8;
+        let array = &marker as *const u8 as CFArrayRef;
+        let mut null_array_read = false;
+
+        assert_eq!(with_cf_array_if_non_null(array, |read| read), Some(array));
+        assert_eq!(
+            with_cf_array_if_non_null(std::ptr::null(), |_| {
+                null_array_read = true;
+            }),
+            None
+        );
+        assert!(!null_array_read);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    /// NULLでないCoreFoundationオブジェクトだけを解放処理へ渡す。
+    // why: 電源一覧のリークを防ぎ、NULLを解放APIへ渡さないため。
+    fn releases_only_non_null_core_foundation_objects() {
+        let marker = 0_u8;
+        let value = &marker as *const u8 as CFTypeRef;
+        let mut released = Vec::new();
+
+        release_cf_object_if_non_null_with(value, |released_value| {
+            released.push(released_value);
+        });
+        release_cf_object_if_non_null_with(std::ptr::null(), |released_value| {
+            released.push(released_value);
+        });
+
+        assert_eq!(released, vec![value]);
     }
 
     #[test]
