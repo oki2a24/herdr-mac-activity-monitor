@@ -298,6 +298,11 @@ fn bundle_display_name(path: &Path, platform_display_name: Option<String>) -> St
         .unwrap_or_else(|| "Unknown app".to_string())
 }
 
+#[cfg(target_os = "macos")]
+fn either_objc_object_is_null(left: *mut std::ffi::c_void, right: *mut std::ffi::c_void) -> bool {
+    left.is_null() || right.is_null()
+}
+
 fn is_system_path(path: &Path) -> bool {
     [
         "/System",
@@ -724,14 +729,14 @@ mod macos {
 
         let manager_class = unsafe { objc_getClass(class_name.as_ptr()) };
         let string_class = unsafe { objc_getClass(string_class_name.as_ptr()) };
-        if manager_class.is_null() || string_class.is_null() {
+        if super::either_objc_object_is_null(manager_class, string_class) {
             drop(pool);
             return None;
         }
 
         let manager = send0(manager_class, selector(&default_manager));
         let path_string = send_string(string_class, selector(&string_with_utf8), path.as_ptr());
-        if manager.is_null() || path_string.is_null() {
+        if super::either_objc_object_is_null(manager, path_string) {
             drop(pool);
             return None;
         }
@@ -1102,6 +1107,21 @@ mod tests {
             file_manager_display_name(&path).as_deref(),
             Some("Cargo.toml")
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    /// Objective-CオブジェクトのどちらかがNULLなら後続の呼び出しを中断する。
+    // why: 片方だけが取得できない場合にNULLをObjective-Cへ渡さないため。
+    fn detects_missing_object_in_objc_pairs() {
+        let marker = 0_u8;
+        let object = &marker as *const u8 as *mut std::ffi::c_void;
+        let null = std::ptr::null_mut();
+
+        assert!(!either_objc_object_is_null(object, object));
+        assert!(either_objc_object_is_null(null, object));
+        assert!(either_objc_object_is_null(object, null));
+        assert!(either_objc_object_is_null(null, null));
     }
 
     #[test]
