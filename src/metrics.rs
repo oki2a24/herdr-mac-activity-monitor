@@ -568,6 +568,15 @@ unsafe extern "C" {
 }
 
 #[cfg(target_os = "macos")]
+unsafe fn cancel_and_release_dispatch_source(source: DispatchSource) {
+    // SAFETY: 呼び出し元が有効なdispatch sourceだけを渡す。
+    unsafe {
+        dispatch_source_cancel(source);
+        dispatch_release(source);
+    }
+}
+
+#[cfg(target_os = "macos")]
 struct PressureContext {
     source: std::sync::atomic::AtomicPtr<std::ffi::c_void>,
     state: std::sync::atomic::AtomicU8,
@@ -578,6 +587,8 @@ struct MemoryPressureMonitor {
     source: DispatchSource,
     #[cfg(target_os = "macos")]
     context: *mut PressureContext,
+    #[cfg(target_os = "macos")]
+    cancel_and_release: unsafe fn(DispatchSource),
 }
 
 impl MemoryPressureMonitor {
@@ -610,7 +621,11 @@ impl MemoryPressureMonitor {
                     );
                     dispatch_resume(source);
                 }
-                return Self { source, context };
+                return Self {
+                    source,
+                    context,
+                    cancel_and_release: cancel_and_release_dispatch_source,
+                };
             }
         }
         // macOS以外、または通知源作成に失敗した場合は、collector全体を止めずに
@@ -620,6 +635,8 @@ impl MemoryPressureMonitor {
             source: std::ptr::null_mut(),
             #[cfg(target_os = "macos")]
             context: std::ptr::null_mut(),
+            #[cfg(target_os = "macos")]
+            cancel_and_release: cancel_and_release_dispatch_source,
         }
     }
 
@@ -687,10 +704,7 @@ impl Drop for MemoryPressureMonitor {
         }
         // SAFETY: The cancellation handler reclaims the context after outstanding event handlers
         // complete. Releasing the source here only drops the dispatch object itself.
-        unsafe {
-            dispatch_source_cancel(self.source);
-            dispatch_release(self.source);
-        }
+        unsafe { (self.cancel_and_release)(self.source) };
     }
 }
 
@@ -866,6 +880,16 @@ pub fn format_popup_lines(snapshot: &PopupSnapshot) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    static MEMORY_PRESSURE_DROP_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    #[cfg(target_os = "macos")]
+    unsafe fn record_memory_pressure_drop(source: DispatchSource) {
+        assert!(!source.is_null());
+        MEMORY_PRESSURE_DROP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     use crate::{
         parsers::{Battery, ChargingState, MemInfo},
         processes::EnergyConsumer,
@@ -1330,6 +1354,7 @@ mod tests {
             let monitor = MemoryPressureMonitor {
                 source: std::ptr::null_mut(),
                 context,
+                cancel_and_release: cancel_and_release_dispatch_source,
             };
 
             let actual = monitor.state();
@@ -1339,6 +1364,38 @@ mod tests {
 
             assert_eq!(actual, expected);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    /// 有効な通知源の破棄時にキャンセル・解放処理を呼び、NULLなら呼ばない。
+    // why: 通知源の解放漏れを防ぎ、作成に失敗したNULL通知源を誤って解放しないため。
+    fn memory_pressure_monitor_drop_cleans_up_active_source() {
+        MEMORY_PRESSURE_DROP_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let null_source_monitor = MemoryPressureMonitor {
+            source: std::ptr::null_mut(),
+            context: std::ptr::null_mut(),
+            cancel_and_release: record_memory_pressure_drop,
+        };
+        drop(null_source_monitor);
+        assert_eq!(
+            MEMORY_PRESSURE_DROP_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+
+        let marker = 0_u8;
+        let source = &marker as *const u8 as DispatchSource;
+        let active_source_monitor = MemoryPressureMonitor {
+            source,
+            context: std::ptr::null_mut(),
+            cancel_and_release: record_memory_pressure_drop,
+        };
+        drop(active_source_monitor);
+
+        assert_eq!(
+            MEMORY_PRESSURE_DROP_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]
