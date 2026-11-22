@@ -365,7 +365,16 @@ pub(crate) fn scan_popup_processes(cancel: Option<&AtomicBool>) -> Option<PopupP
         cancel,
         PROCESS_SCAN_TIMEOUT,
         scan_memory_top_three,
-        scan_process_energy,
+        |pids, deadline, cancel| {
+            scan_process_energy(
+                pids,
+                deadline,
+                cancel,
+                process_energy_usage,
+                process_executable_path,
+                display_name_for_bundle,
+            )
+        },
     ))
 }
 
@@ -412,11 +421,19 @@ fn scan_memory_top_three(
     Some(top_three(processes))
 }
 
-fn scan_process_energy(
+fn scan_process_energy<ReadEnergy, ResolvePath, DisplayName>(
     pids: &[u32],
     deadline: Instant,
     cancel: Option<&AtomicBool>,
-) -> Option<Vec<ProcessEnergySample>> {
+    mut read_energy: ReadEnergy,
+    mut resolve_path: ResolvePath,
+    mut display_name: DisplayName,
+) -> Option<Vec<ProcessEnergySample>>
+where
+    ReadEnergy: FnMut(u32) -> Option<(u64, u64)>,
+    ResolvePath: FnMut(u32) -> Option<String>,
+    DisplayName: FnMut(&Path) -> String,
+{
     if pids.is_empty() {
         return Some(Vec::new());
     }
@@ -427,17 +444,17 @@ fn scan_process_energy(
         if cancel.is_some_and(|flag| !flag.load(Ordering::Acquire)) || Instant::now() >= deadline {
             return None;
         }
-        let Some((started_at, energy_nj)) = process_energy_usage(pid) else {
+        let Some((started_at, energy_nj)) = read_energy(pid) else {
             continue;
         };
-        let path = process_executable_path(pid).map(PathBuf::from);
+        let path = resolve_path(pid).map(PathBuf::from);
         let application = path
             .as_deref()
             .and_then(outermost_app_bundle)
             .map(|app_path| {
                 let name = app_names
                     .entry(app_path.clone())
-                    .or_insert_with(|| display_name_for_bundle(&app_path))
+                    .or_insert_with(|| display_name(&app_path))
                     .clone();
                 AppBundle {
                     path: app_path,
@@ -1119,6 +1136,104 @@ Auxiliary data:
                 .collect::<Vec<_>>(),
             vec![("Stable", 0.1, 1)]
         );
+    }
+
+    #[test]
+    /// process energy scanは注入された取得値でアプリ情報と個別プロセス名を作る。
+    // why: OSのプロセス情報を使わず、取得成功・失敗と名前付けの契約を再現するため。
+    fn process_energy_scan_uses_injected_data_and_skips_unavailable_processes() {
+        let samples = scan_process_energy(
+            &[10, 20, 30],
+            Instant::now() + Duration::from_secs(1),
+            None,
+            |pid| match pid {
+                10 => Some((100, 200)),
+                20 => Some((200, 300)),
+                _ => None,
+            },
+            |pid| match pid {
+                10 => Some("/Applications/Example.app/Contents/MacOS/Example".to_string()),
+                20 => Some("/usr/local/bin/helper".to_string()),
+                _ => None,
+            },
+            |_| "Example Display".to_string(),
+        )
+        .expect("available energy samples should be returned");
+
+        assert_eq!(
+            samples,
+            vec![
+                ProcessEnergySample {
+                    pid: 10,
+                    started_at: 100,
+                    energy_nj: 200,
+                    name: "Example Display".to_string(),
+                    application: Some(AppBundle {
+                        path: PathBuf::from("/Applications/Example.app"),
+                        name: "Example Display".to_string(),
+                    }),
+                },
+                ProcessEnergySample {
+                    pid: 20,
+                    started_at: 200,
+                    energy_nj: 300,
+                    name: "Process · helper (PID 20)".to_string(),
+                    application: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    /// キャンセルまたは期限切れならOS情報を読まずenergy scanを中断する。
+    // why: popupが閉じた後や予算時間を過ぎた後に追加のプロセス取得を始めないため。
+    fn process_energy_scan_stops_before_reading_when_cancelled_or_expired() {
+        let cancelled = AtomicBool::new(false);
+        let cancelled_result = scan_process_energy(
+            &[10],
+            Instant::now() + Duration::from_secs(1),
+            Some(&cancelled),
+            |_| panic!("cancelled scan must not query energy"),
+            |_| panic!("cancelled scan must not query path"),
+            |_| panic!("cancelled scan must not resolve display names"),
+        );
+        assert!(cancelled_result.is_none());
+
+        let expired_result = scan_process_energy(
+            &[10],
+            Instant::now() - Duration::from_millis(1),
+            None,
+            |_| panic!("expired scan must not query energy"),
+            |_| panic!("expired scan must not query path"),
+            |_| panic!("expired scan must not resolve display names"),
+        );
+        assert!(expired_result.is_none());
+    }
+
+    #[test]
+    /// PID一覧が空なら空の成功結果、値が全て取得不能ならNoneを返す。
+    // why: 「対象プロセスなし」と「energy取得失敗」を同じ状態に潰さないため。
+    fn process_energy_scan_distinguishes_empty_from_unavailable_results() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let empty = scan_process_energy(
+            &[],
+            deadline,
+            None,
+            |_| panic!("empty scan must not query energy"),
+            |_| panic!("empty scan must not query path"),
+            |_| panic!("empty scan must not resolve display names"),
+        );
+        assert_eq!(empty, Some(Vec::new()));
+
+        let unavailable = scan_process_energy(
+            &[10],
+            deadline,
+            None,
+            |_| None,
+            |_| panic!("unavailable energy must skip path lookup"),
+            |_| panic!("unavailable energy must skip display names"),
+        );
+        assert_eq!(unavailable, None);
     }
 
     #[test]
