@@ -20,7 +20,7 @@ pub fn run() -> std::io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, Hide)?;
-    let result = run_loop(&mut stdout);
+    let result = run_loop(&mut stdout, event::poll, event::read, || memory::get().ok());
     disable_raw_mode()?;
     execute!(stdout, LeaveAlternateScreen, Show)?;
     result
@@ -28,17 +28,28 @@ pub fn run() -> std::io::Result<()> {
 
 /// 3秒ごと、またはキー入力時にデータを取得して画面を再描画する。
 /// `q` / `Esc` でループから抜ける。
-fn run_loop<F: std::io::Write>(out: &mut F) -> std::io::Result<()> {
+fn run_loop<F, P, R, M>(
+    out: &mut F,
+    mut poll: P,
+    mut read: R,
+    mut get_memory: M,
+) -> std::io::Result<()>
+where
+    F: std::io::Write,
+    P: FnMut(Duration) -> std::io::Result<bool>,
+    R: FnMut() -> std::io::Result<event::Event>,
+    M: FnMut() -> Option<crate::parsers::MemInfo>,
+{
     let tick = Duration::from_secs(3);
     let mut popup = PopupState::new();
     loop {
-        let mem = memory::get().ok();
+        let mem = get_memory();
         let snapshot = popup.collect(mem);
         render_frame(out, &crate::metrics::format_popup_lines(&snapshot))?;
         // 入力待ち 3 秒。入力があれば読み取り、キーなら q/Esc で抜ける、
         // 別のイベントなら継続。タイムアウトなら次の 3 秒で再更新。
-        if let Ok(true) = event::poll(tick) {
-            if let event::Event::Key(k) = event::read()? {
+        if let Ok(true) = poll(tick) {
+            if let event::Event::Key(k) = read()? {
                 if matches!(k.code, KeyCode::Char('q') | KeyCode::Esc) {
                     break;
                 }
@@ -62,8 +73,88 @@ fn render_frame<F: std::io::Write>(out: &mut F, lines: &[String]) -> std::io::Re
 
 #[cfg(test)]
 mod tests {
-    use super::render_frame;
+    use super::{render_frame, run_loop};
     use crate::parsers::{format_lines, Battery, ChargingState, MemInfo};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use std::time::Duration;
+
+    #[test]
+    /// 通常キーとタイムアウトでは再描画を続け、qでループを終了する。
+    // why: 入力がない時間帯や終了以外のキーで監視画面が止まらないため。
+    fn run_loop_redraws_after_timeout_or_other_key_and_exits_on_q() {
+        let mut output = Vec::new();
+        let mut polls = [true, false, true].into_iter();
+        let mut poll_count = 0;
+        let mut keys = [
+            Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+        ]
+        .into_iter();
+        let mut read_count = 0;
+        let mut memory_count = 0;
+
+        run_loop(
+            &mut output,
+            |timeout| {
+                assert_eq!(timeout, Duration::from_secs(3));
+                poll_count += 1;
+                Ok(polls.next().unwrap())
+            },
+            || {
+                read_count += 1;
+                Ok(keys.next().unwrap())
+            },
+            || {
+                memory_count += 1;
+                Some(MemInfo {
+                    used_gb: 1.0,
+                    total_gb: 2.0,
+                    percent: 50,
+                })
+            },
+        )
+        .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(poll_count, 3);
+        assert_eq!(read_count, 2);
+        assert_eq!(memory_count, 3);
+        assert_eq!(output.matches("\x1b[2J").count(), 3);
+    }
+
+    #[test]
+    /// Escapeキーで監視画面のループを終了する。
+    // why: q以外にも説明されている終了操作を使えるようにするため。
+    fn run_loop_exits_on_escape() {
+        let mut output = Vec::new();
+        let mut polls = 0;
+
+        run_loop(
+            &mut output,
+            |_| {
+                polls += 1;
+                Ok(true)
+            },
+            || Ok(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))),
+            || {
+                Some(MemInfo {
+                    used_gb: 1.0,
+                    total_gb: 2.0,
+                    percent: 50,
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(polls, 1);
+        assert_eq!(
+            String::from_utf8(output)
+                .unwrap()
+                .matches("\x1b[2J")
+                .count(),
+            1
+        );
+    }
 
     #[test]
     /// 端末の生モードで各行の先頭が左端に揃うようCRLFを出力する。
