@@ -1,4 +1,4 @@
-.PHONY: fmt fmt-check check lint test audit version-check build verify ci
+.PHONY: fmt fmt-check check lint test mutants audit version-check build verify ci
 
 version-check:
 	@cargo_v=$$(grep '^version' Cargo.toml); \
@@ -26,6 +26,10 @@ lint:
 
 test:
 	cargo test --all-targets --all-features
+
+# ミューテーションテストを任意で実行する（verify / ci には含めない）。
+mutants:
+	cargo mutants $(MUTANTS_ARGS)
 
 audit:
 	cargo audit

@@ -61,6 +61,22 @@ make audit
 
 `△` は変更内容に応じて判断します。
 
+## ミューテーションテスト
+
+`cargo-mutants` は任意の補助検証として `make mutants` から実行します。`make test`、`make verify`、`make ci` には含めず、ロジック変更の検証やテストの見直しに必要なときに個別実行します。
+
+```bash
+# 全体を対象にする
+make mutants
+
+# 変更したファイルに絞る
+make mutants MUTANTS_ARGS="--file src/parsers.rs"
+```
+
+`cargo-mutants` は開発環境に別途インストールしてください。これはアプリの実行時依存ではありません。結果に `missed` があれば変異内容と期待する振る舞いを確認し、必要なテストだけを追加します。等価な変異や重要度の低い変異のために、スコアだけを追ってテストを増やさないでください。
+
+`--in-diff` を使う差分実行は、テストコードだけの変更ではミュータントを実行しません。差分実行は素早い確認に使い、必要に応じて全体実行も行ってください。実行結果の `mutants.out/` はGit管理しません。
+
 ## version-check
 
 `make version-check` は `Cargo.toml` と `herdr-plugin.toml` の `version` が一致しているかを検証します。
