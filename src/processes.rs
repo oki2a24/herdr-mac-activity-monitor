@@ -1030,6 +1030,19 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
+    /// Foundationが既存ファイルのFinder表示名を返す。
+    // why: Objective-C呼び出しの戻り値がアプリ表示名の取得まで届くことを確認するため。
+    fn foundation_returns_display_name_for_existing_file() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+
+        assert_eq!(
+            file_manager_display_name(&path).as_deref(),
+            Some("Cargo.toml")
+        );
+    }
+
+    #[test]
     /// メモリ取得の時間切れ後もenergy取得には独立した時間枠を与える。
     // why: footprintの遅延だけでenergyカウンターの取得機会を失わないため。
     fn popup_energy_scan_gets_a_fresh_deadline_after_memory_times_out() {
