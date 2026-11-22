@@ -8,11 +8,8 @@ on:
 
 jobs:
   verify:
-    name: Verify (${{ matrix.os }})
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    name: Verify (macOS)
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -31,9 +28,6 @@ jobs:
        - name: Install Rust toolchain
          uses: dtolnay/rust-toolchain@stable
        - name: Install cargo-audit
-         uses: cargo-bins/cargo-binstall@main
-         with:
-           name: cargo-audit
-           args: --no-track
+         run: cargo install cargo-audit --locked
        - name: Security audit
          run: make audit

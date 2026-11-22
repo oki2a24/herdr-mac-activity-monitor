@@ -38,9 +38,8 @@ make verify
 
 ### Level 3：CI
 
-CIでは `ubuntu-latest` と `macos-latest` の両方で `make verify` を実行します。
-Ubuntu側で非macOS用フォールバックを含むビルド・テストを確認し、macOS側で製品のサポート対象となるOS固有コードを検証します。
-依存関係のセキュリティ監査はUbuntu上で実行します。
+CIでは製品のサポート対象であるmacOS上で `make verify` を実行します。
+依存関係のセキュリティ監査は、プラットフォームに依存しないためUbuntu上で実行します。
 
 ```bash
 make verify
