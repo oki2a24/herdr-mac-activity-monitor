@@ -32,3 +32,7 @@
 - コンパイル不能の2件は `compute_memory` と `parse_vm_stat` を `Ok(Default::default())` に置換する変異で、返却型に `Default` が実装されていないため生成したコードが成立しなかった。
 - この対象では追加テストは不要と判断した。結果は `src/parsers.rs` と今回の変異パターンに限られ、他モジュールや別の変異パターンの十分性は示さない。
 - ツールと `mutants.out` はプロジェクト外の一時領域に置いた。`Cargo.toml` と `Cargo.lock` は変更していない。
+
+## 後続作業での範囲拡大
+
+この文書は `src/parsers.rs` の初回試行計画と結果を記録する。ここにある「他モジュールへ対象を拡大しない」という判断は初回試行に限ったもの。その後、ミューテーション結果を起点に battery、memory、metrics、processes、TUI、watch、アプリケーション入口へ段階的に対象を広げた。`cargo-mutants` を任意の開発用ツールとし、通常の `make verify` / `make ci` に含めない方針は維持している。
