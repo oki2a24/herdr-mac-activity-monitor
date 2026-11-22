@@ -840,17 +840,39 @@ fn drain_available(reader: &mut impl Read, output: &mut Vec<u8>) -> io::Result<(
 fn set_nonblocking(fd: i32) -> io::Result<()> {
     const F_GETFL: i32 = 3;
     const F_SETFL: i32 = 4;
-    const O_NONBLOCK: i32 = 0x0004;
     unsafe extern "C" {
         fn fcntl(fd: i32, command: i32, ...) -> i32;
     }
-    // SAFETY: `fd` is the live stdout descriptor owned by the child process handle.
-    let flags = unsafe { fcntl(fd, F_GETFL) };
+
+    set_nonblocking_with(
+        fd,
+        |fd| {
+            // SAFETY: `fd` is the live stdout descriptor owned by the child process handle.
+            unsafe { fcntl(fd, F_GETFL) }
+        },
+        |fd, flags| {
+            // SAFETY: fcntl receives the descriptor, command, and flags expected by macOS.
+            unsafe { fcntl(fd, F_SETFL, flags) }
+        },
+    )
+}
+
+fn set_nonblocking_with<GetFlags, SetFlags>(
+    fd: i32,
+    get_flags: GetFlags,
+    set_flags: SetFlags,
+) -> io::Result<()>
+where
+    GetFlags: FnOnce(i32) -> i32,
+    SetFlags: FnOnce(i32, i32) -> i32,
+{
+    const O_NONBLOCK: i32 = 0x0004;
+
+    let flags = get_flags(fd);
     if flags < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: fcntl receives the descriptor, command, and integer flags expected by macOS.
-    if unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } < 0 {
+    if set_flags(fd, flags | O_NONBLOCK) < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -1818,5 +1840,15 @@ Auxiliary data:
         assert!(second_result.is_ok());
         assert_ne!(flags & 0x0004, 0);
         assert_ne!(flags & 0x0008, 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    /// F_SETFLの失敗をエラーとして返す。
+    // why: 非ブロッキング化できないstdoutをblocking readへ渡して待ち続けないため。
+    fn set_nonblocking_reports_flag_update_failure() {
+        let result = set_nonblocking_with(42, |_| 0, |_, _| -1);
+
+        assert!(result.is_err());
     }
 }
