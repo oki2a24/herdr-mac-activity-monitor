@@ -290,15 +290,22 @@ fn readable_process_name(name: &str, pid: u32, path: Option<&Path>) -> String {
     format!("{category} · {name} (PID {pid})")
 }
 
-fn attribute_processes(processes: &mut [ProcessMemory]) {
+fn attribute_processes<ResolvePath, DisplayName>(
+    processes: &mut [ProcessMemory],
+    mut resolve_path: ResolvePath,
+    mut display_name: DisplayName,
+) where
+    ResolvePath: FnMut(u32) -> Option<String>,
+    DisplayName: FnMut(&Path) -> String,
+{
     let mut app_names = HashMap::<PathBuf, String>::new();
     for process in processes {
-        let path = process_executable_path(process.pid).map(PathBuf::from);
+        let path = resolve_path(process.pid).map(PathBuf::from);
         let app_path = path.as_deref().and_then(outermost_app_bundle);
         if let Some(app_path) = app_path {
             let name = app_names
                 .entry(app_path.clone())
-                .or_insert_with(|| display_name_for_bundle(&app_path))
+                .or_insert_with(|| display_name(&app_path))
                 .clone();
             process.application = Some(AppBundle {
                 path: app_path,
@@ -364,7 +371,11 @@ pub(crate) fn scan_popup_processes(cancel: Option<&AtomicBool>) -> Option<PopupP
         &pids,
         cancel,
         PROCESS_SCAN_TIMEOUT,
-        scan_memory_top_three,
+        |pids, deadline, cancel| {
+            scan_memory_top_three(pids, deadline, cancel, run_footprint_command, |processes| {
+                attribute_processes(processes, process_executable_path, display_name_for_bundle)
+            })
+        },
         |pids, deadline, cancel| {
             scan_process_energy(
                 pids,
@@ -397,14 +408,35 @@ where
     PopupProcessScan { memory, energy }
 }
 
-fn scan_memory_top_three(
+fn scan_memory_top_three<FootprintScan, Attribute>(
     pids: &[u32],
     deadline: Instant,
     cancel: Option<&AtomicBool>,
-) -> Option<Vec<MemoryConsumer>> {
+    scan_footprint: FootprintScan,
+    attribute: Attribute,
+) -> Option<Vec<MemoryConsumer>>
+where
+    FootprintScan: FnOnce(&[u32], Instant, Option<&AtomicBool>) -> Option<(bool, Vec<u8>)>,
+    Attribute: FnOnce(&mut [ProcessMemory]),
+{
     if pids.is_empty() {
         return Some(Vec::new());
     }
+
+    let (success, output) = scan_footprint(pids, deadline, cancel)?;
+    let mut processes = parse_footprint_processes(&String::from_utf8_lossy(&output));
+    if processes.is_empty() && !success {
+        return None;
+    }
+    attribute(&mut processes);
+    Some(top_three(processes))
+}
+
+fn run_footprint_command(
+    pids: &[u32],
+    deadline: Instant,
+    cancel: Option<&AtomicBool>,
+) -> Option<(bool, Vec<u8>)> {
     let mut command = Command::new("footprint");
     command.args(["--noCategories", "--format", "bytes"]);
     for pid in pids {
@@ -413,12 +445,7 @@ fn scan_memory_top_three(
     command.stdout(Stdio::piped());
     let child = spawn_with_suppressed_stderr(command)?;
     let (status, output) = wait_for_child(child, deadline, cancel)?;
-    let mut processes = parse_footprint_processes(&String::from_utf8_lossy(&output));
-    if processes.is_empty() && !status.success() {
-        return None;
-    }
-    attribute_processes(&mut processes);
-    Some(top_three(processes))
+    Some((status.success(), output))
 }
 
 fn scan_process_energy<ReadEnergy, ResolvePath, DisplayName>(
@@ -919,6 +946,114 @@ Auxiliary data:
         assert_eq!(
             readable_process_name("python3", 88, Some(Path::new("/opt/homebrew/bin/python3"))),
             "Process · python3 (PID 88)"
+        );
+    }
+
+    #[test]
+    /// process pathに従ってアプリhelperを同じbundleへ分類し、bundle外は名前付けする。
+    // why: メモリ集計前にPIDごとの実行ファイル情報を正しく反映するため。
+    fn attributes_processes_from_resolved_paths() {
+        let mut processes = vec![
+            ProcessMemory {
+                pid: 10,
+                name: "Example".to_string(),
+                bytes: 100,
+                application: None,
+            },
+            ProcessMemory {
+                pid: 11,
+                name: "Example Helper".to_string(),
+                bytes: 200,
+                application: None,
+            },
+            ProcessMemory {
+                pid: 12,
+                name: "WindowServer".to_string(),
+                bytes: 300,
+                application: None,
+            },
+        ];
+
+        attribute_processes(
+            &mut processes,
+            |pid| match pid {
+                10 => Some("/Applications/Example.app/Contents/MacOS/Example".to_string()),
+                11 => Some("/Applications/Example.app/Contents/Helpers/Example Helper".to_string()),
+                12 => Some("/System/Library/WindowServer".to_string()),
+                _ => None,
+            },
+            |_| "Example Display".to_string(),
+        );
+
+        assert_eq!(
+            processes,
+            vec![
+                ProcessMemory {
+                    pid: 10,
+                    name: "Example".to_string(),
+                    bytes: 100,
+                    application: Some(AppBundle {
+                        path: PathBuf::from("/Applications/Example.app"),
+                        name: "Example Display".to_string(),
+                    }),
+                },
+                ProcessMemory {
+                    pid: 11,
+                    name: "Example Helper".to_string(),
+                    bytes: 200,
+                    application: Some(AppBundle {
+                        path: PathBuf::from("/Applications/Example.app"),
+                        name: "Example Display".to_string(),
+                    }),
+                },
+                ProcessMemory {
+                    pid: 12,
+                    name: "macOS · WindowServer (PID 12)".to_string(),
+                    bytes: 300,
+                    application: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    /// memory scanは空PIDを空結果にし、失敗時も解析済みの部分結果を保つ。
+    // why: 対象なし・完全失敗・部分的な取得成功を正しく区別するため。
+    fn memory_scan_distinguishes_empty_failed_and_partial_results() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let empty = scan_memory_top_three(
+            &[],
+            deadline,
+            None,
+            |_, _, _| panic!("empty scan must not start footprint"),
+            |_| panic!("empty scan must not attribute processes"),
+        );
+        assert_eq!(empty, Some(Vec::new()));
+
+        let failed = scan_memory_top_three(
+            &[10],
+            deadline,
+            None,
+            |_, _, _| Some((false, Vec::new())),
+            |_| panic!("failed output must not contain processes"),
+        );
+        assert_eq!(failed, None);
+
+        let output = b"Example [10]: 64-bit Footprint: 1,024 bytes\nphys_footprint: 1,024\n";
+        let partial = scan_memory_top_three(
+            &[10],
+            deadline,
+            None,
+            |_, _, _| Some((false, output.to_vec())),
+            |_| {},
+        );
+        assert_eq!(
+            partial,
+            Some(vec![MemoryConsumer {
+                name: "Example".to_string(),
+                bytes: 1_024,
+                process_count: 1,
+            }])
         );
     }
 
