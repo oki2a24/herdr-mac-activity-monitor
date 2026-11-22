@@ -12,6 +12,14 @@ pub fn should_exit(failed_count: u32, max_fail: u32, socket_exists: bool) -> boo
     failed_count > max_fail
 }
 
+fn record_title_update_result(failed_count: &mut u32, succeeded: bool) {
+    if succeeded {
+        *failed_count = 0;
+    } else {
+        *failed_count += 1;
+    }
+}
+
 /// 与えられた pid が生きていれば `true`。`pid == 0` は `false`。
 /// Unix では `kill -0 <pid>` の結果で判定する（シグナルは実際に送らない）。
 pub fn is_pid_alive(pid: u32) -> bool {
@@ -61,9 +69,9 @@ pub fn run() -> std::io::Result<()> {
         let batt = crate::battery::get();
         let title = crate::parsers::format_window_title(&mem, &batt);
         match crate::herdr::set_window_title(&title) {
-            Ok(()) => failed = 0,
+            Ok(()) => record_title_update_result(&mut failed, true),
             Err(e) => {
-                failed += 1;
+                record_title_update_result(&mut failed, false);
                 eprintln!("warn: failed to set window title: {e}");
                 let socket =
                     std::env::var_os("HERDR_SOCKET_PATH").and_then(|p| fs::metadata(p).ok());
@@ -110,6 +118,92 @@ mod tests {
     fn exits_when_socket_present_and_over_threshold() {
         assert!(should_exit(6, 5, true));
         assert!(should_exit(100, 5, true));
+    }
+
+    #[test]
+    /// window title更新の失敗ごとに連続失敗回数を1ずつ増やす。
+    // why: 閾値判定に渡す回数を失敗数と一致させるため。
+    fn failed_title_update_increments_failure_count_once() {
+        let mut failed = 0;
+
+        record_title_update_result(&mut failed, false);
+        assert_eq!(failed, 1);
+        record_title_update_result(&mut failed, false);
+        assert_eq!(failed, 2);
+    }
+
+    #[test]
+    /// window title更新に成功したら連続失敗回数をゼロへ戻す。
+    // why: 過去の失敗を現在の連続失敗として数え続けないため。
+    fn successful_title_update_resets_failure_count() {
+        let mut failed = 2;
+
+        record_title_update_result(&mut failed, true);
+
+        assert_eq!(failed, 0);
+    }
+
+    #[test]
+    /// ロック取得後にタイトル更新が失敗し、ソケット不在なら監視を終了する。
+    // why: ロック成功時の本体実行と接続断時の終了・後始末を確認するため。
+    fn run_exits_after_title_update_fails_without_socket() {
+        const CHILD_ENV: &str = "HERDR_WATCH_RUN_CHILD";
+        if env::var_os(CHILD_ENV).is_some() {
+            run().expect("watch should exit cleanly when the socket is absent");
+            return;
+        }
+
+        use std::env::temp_dir;
+        let dir = temp_dir().join(format!("am-watch-run-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("state directory must be created");
+        let socket = dir.join("missing.sock");
+        let mut child = std::process::Command::new(
+            std::env::current_exe().expect("test binary path must be available"),
+        )
+        .args([
+            "--exact",
+            "watch::tests::run_exits_after_title_update_fails_without_socket",
+            "--nocapture",
+        ])
+        .env(CHILD_ENV, "1")
+        .env("HERDR_PLUGIN_STATE_DIR", &dir)
+        .env("HERDR_SOCKET_PATH", &socket)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("child test process must start");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut finished_before_deadline = false;
+        while std::time::Instant::now() < deadline {
+            if child
+                .try_wait()
+                .expect("child test status must be readable")
+                .is_some()
+            {
+                finished_before_deadline = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !finished_before_deadline {
+            let _ = child.kill();
+        }
+        let output = child
+            .wait_with_output()
+            .expect("child test output must be available");
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(
+            finished_before_deadline,
+            "watch must stop instead of looping on a missing socket: {output:?}"
+        );
+        assert!(output.status.success(), "child test failed: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.matches("warn: failed to set window title").count(),
+            1,
+            "run should attempt one title update before exiting: {stderr}"
+        );
     }
 
     #[test]
