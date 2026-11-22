@@ -251,7 +251,11 @@ fn outermost_app_bundle(executable_path: &Path) -> Option<PathBuf> {
 }
 
 fn display_name_for_bundle(path: &Path) -> String {
-    file_manager_display_name(path)
+    bundle_display_name(path, file_manager_display_name(path))
+}
+
+fn bundle_display_name(path: &Path, platform_display_name: Option<String>) -> String {
+    platform_display_name
         .and_then(|display_name| {
             Path::new(&display_name)
                 .file_name()
@@ -355,22 +359,11 @@ fn top_three(processes: Vec<ProcessMemory>) -> Vec<MemoryConsumer> {
 /// PID列挙に失敗した場合は`None`を返す。高コストの取得はpopup workerから呼び出す。
 pub(crate) fn scan_popup_processes(cancel: Option<&AtomicBool>) -> Option<PopupProcessScan> {
     const PROCESS_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
-    let deadline = Instant::now() + PROCESS_SCAN_TIMEOUT;
-    let mut ps_command = Command::new("ps");
-    ps_command
-        .args(["-axo", "ruid=,pid="])
-        .stdout(Stdio::piped());
-    let ps_child = spawn_with_suppressed_stderr(ps_command)?;
-    let (ps_status, ps_output) = wait_for_child(ps_child, deadline, cancel)?;
-    if !ps_status.success() {
-        return None;
-    }
-    let pids =
-        parse_process_ids_for_real_uid(&String::from_utf8_lossy(&ps_output), current_real_uid());
-    Some(scan_popup_sources_with_independent_deadlines(
-        &pids,
+    scan_popup_processes_with(
         cancel,
         PROCESS_SCAN_TIMEOUT,
+        run_process_list_command,
+        current_real_uid,
         |pids, deadline, cancel| {
             scan_memory_top_three(pids, deadline, cancel, run_footprint_command, |processes| {
                 attribute_processes(processes, process_executable_path, display_name_for_bundle)
@@ -386,7 +379,49 @@ pub(crate) fn scan_popup_processes(cancel: Option<&AtomicBool>) -> Option<PopupP
                 display_name_for_bundle,
             )
         },
+    )
+}
+
+fn scan_popup_processes_with<ProcessListScan, RealUid, MemoryScan, EnergyScan>(
+    cancel: Option<&AtomicBool>,
+    timeout: Duration,
+    scan_process_list: ProcessListScan,
+    real_uid: RealUid,
+    scan_memory: MemoryScan,
+    scan_energy: EnergyScan,
+) -> Option<PopupProcessScan>
+where
+    ProcessListScan: FnOnce(Instant, Option<&AtomicBool>) -> Option<(bool, Vec<u8>)>,
+    RealUid: FnOnce() -> u32,
+    MemoryScan: FnOnce(&[u32], Instant, Option<&AtomicBool>) -> Option<Vec<MemoryConsumer>>,
+    EnergyScan: FnOnce(&[u32], Instant, Option<&AtomicBool>) -> Option<Vec<ProcessEnergySample>>,
+{
+    let deadline = Instant::now() + timeout;
+    let (success, ps_output) = scan_process_list(deadline, cancel)?;
+    if !success {
+        return None;
+    }
+    let pids = parse_process_ids_for_real_uid(&String::from_utf8_lossy(&ps_output), real_uid());
+    Some(scan_popup_sources_with_independent_deadlines(
+        &pids,
+        cancel,
+        timeout,
+        scan_memory,
+        scan_energy,
     ))
+}
+
+fn run_process_list_command(
+    deadline: Instant,
+    cancel: Option<&AtomicBool>,
+) -> Option<(bool, Vec<u8>)> {
+    let mut ps_command = Command::new("ps");
+    ps_command
+        .args(["-axo", "ruid=,pid="])
+        .stdout(Stdio::piped());
+    let ps_child = spawn_with_suppressed_stderr(ps_command)?;
+    let (ps_status, ps_output) = wait_for_child(ps_child, deadline, cancel)?;
+    Some((ps_status.success(), ps_output))
 }
 
 fn scan_popup_sources_with_independent_deadlines<MemoryScan, EnergyScan>(
@@ -932,6 +967,72 @@ Auxiliary data:
     }
 
     #[test]
+    /// process listから現在UIDのPIDだけ選び、独立した2種類のscanへ渡す。
+    // why: 他ユーザーのプロセスを混ぜず、memory・energy両方の取得を継続するため。
+    fn popup_process_scan_filters_uid_and_runs_both_sources() {
+        let timeout = Duration::from_secs(3);
+        let earliest_deadline = Instant::now() + timeout;
+        let scanned = scan_popup_processes_with(
+            None,
+            timeout,
+            |deadline, _| {
+                assert!(deadline >= earliest_deadline);
+                Some((true, b"501 101\n502 202\n".to_vec()))
+            },
+            || 501,
+            |pids, _, _| {
+                assert_eq!(pids, [101]);
+                Some(vec![MemoryConsumer {
+                    name: "Example".to_string(),
+                    bytes: 1_024,
+                    process_count: 1,
+                }])
+            },
+            |pids, _, _| {
+                assert_eq!(pids, [101]);
+                Some(Vec::new())
+            },
+        )
+        .expect("successful process listing should produce a scan");
+
+        assert_eq!(
+            scanned.memory,
+            Some(vec![MemoryConsumer {
+                name: "Example".to_string(),
+                bytes: 1_024,
+                process_count: 1,
+            }])
+        );
+        assert_eq!(scanned.energy, Some(Vec::new()));
+    }
+
+    #[test]
+    /// process listの起動失敗や異常終了は空スキャンとして扱わない。
+    // why: プロセス一覧取得に失敗した状態を「対象PIDなし」と誤認しないため。
+    fn popup_process_scan_stops_when_process_listing_fails() {
+        let timeout = Duration::from_secs(1);
+        let unavailable = scan_popup_processes_with(
+            None,
+            timeout,
+            |_, _| None::<(bool, Vec<u8>)>,
+            || panic!("UID is not needed when process listing is unavailable"),
+            |_, _, _| panic!("scans must not run when process listing is unavailable"),
+            |_, _, _| panic!("scans must not run when process listing is unavailable"),
+        );
+        assert!(unavailable.is_none());
+
+        let unsuccessful = scan_popup_processes_with(
+            None,
+            timeout,
+            |_, _| Some((false, Vec::new())),
+            || panic!("UID is not needed when process listing fails"),
+            |_, _, _| panic!("scans must not run when process listing fails"),
+            |_, _, _| panic!("scans must not run when process listing fails"),
+        );
+        assert!(unsuccessful.is_none());
+    }
+
+    #[test]
     /// アプリバンドル外のシステムプロセスとコマンドを区別して表示する。
     // why: アプリ外の項目をアプリと誤認しないため。
     fn labels_unbundled_system_and_command_processes() {
@@ -1065,6 +1166,20 @@ Auxiliary data:
             display_name_for_bundle(Path::new("/Applications/Example App.app")),
             "Example App"
         );
+    }
+
+    #[test]
+    /// OSの表示名が拡張子だけならbundle名へフォールバックする。
+    // why: 空の表示名をアプリ名として表示しないため。
+    fn bundle_display_name_falls_back_from_empty_os_name() {
+        assert_eq!(
+            bundle_display_name(
+                Path::new("/Applications/Example App.app"),
+                Some(".app".to_string()),
+            ),
+            "Example App"
+        );
+        assert_eq!(bundle_display_name(Path::new(""), None), "Unknown app");
     }
 
     #[test]
