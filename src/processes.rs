@@ -986,6 +986,50 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
+    /// current_real_uidがOSの返す実ユーザーIDを返す。
+    // why: 別ユーザーのPIDを除外する入口で、固定値を使って誤ったプロセス集合にしないため。
+    fn current_real_uid_matches_system_real_uid() {
+        let output = Command::new("/usr/bin/id")
+            .args(["-ru"])
+            .output()
+            .expect("macOS id command should be available");
+        assert!(output.status.success());
+        let expected = String::from_utf8(output.stdout)
+            .expect("id output should be UTF-8")
+            .trim()
+            .parse::<u32>()
+            .expect("id should print a numeric real UID");
+
+        assert_eq!(current_real_uid(), expected);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    /// macOS APIから現在のテストプロセスの実行ファイルパスを取得する。
+    // why: プロセスをアプリへ正しく紐付けるため、取得不能や空のパスを見逃さないようにする。
+    fn current_process_executable_path_is_absolute() {
+        let path = process_executable_path(std::process::id())
+            .expect("macOS should report the current process executable path");
+
+        assert!(Path::new(&path).is_absolute(), "unexpected path: {path}");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    /// macOS APIから現在のテストプロセスの開始時刻とenergy値を取得する。
+    // why: energy計測でPID再利用を判別する開始時刻が、実測値として取得できることを確認するため。
+    fn current_process_energy_usage_has_start_time() {
+        let (started_at, _energy_nj) = process_energy_usage(std::process::id())
+            .expect("macOS should report resource usage for the current process");
+
+        assert!(
+            started_at > 1,
+            "process start absolute time should be a real, nontrivial value"
+        );
+    }
+
+    #[test]
     /// メモリ取得の時間切れ後もenergy取得には独立した時間枠を与える。
     // why: footprintの遅延だけでenergyカウンターの取得機会を失わないため。
     fn popup_energy_scan_gets_a_fresh_deadline_after_memory_times_out() {
