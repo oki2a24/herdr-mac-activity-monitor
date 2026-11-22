@@ -659,11 +659,15 @@ mod macos {
         fn objc_autoreleasePoolPop(context: *mut c_void);
     }
 
-    struct AutoreleasePool(*mut c_void);
+    struct AutoreleasePool {
+        context: *mut c_void,
+        pop: unsafe extern "C" fn(*mut c_void),
+    }
 
     impl Drop for AutoreleasePool {
         fn drop(&mut self) {
-            unsafe { objc_autoreleasePoolPop(self.0) };
+            // SAFETY: The context matches the pop function stored when this guard was created.
+            unsafe { (self.pop)(self.context) };
         }
     }
 
@@ -705,7 +709,11 @@ mod macos {
     }
 
     pub(super) fn file_manager_display_name(path: &Path) -> Option<String> {
-        let pool = AutoreleasePool(unsafe { objc_autoreleasePoolPush() });
+        let pool = AutoreleasePool {
+            // SAFETY: Push creates a pool context consumed by `Drop` below.
+            context: unsafe { objc_autoreleasePoolPush() },
+            pop: objc_autoreleasePoolPop,
+        };
         let class_name = CString::new("NSFileManager").ok()?;
         let default_manager = CString::new("defaultManager").ok()?;
         let string_class_name = CString::new("NSString").ok()?;
@@ -776,6 +784,38 @@ mod macos {
         let send: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void =
             unsafe { std::mem::transmute(objc_msgSend as *const ()) };
         unsafe { send(receiver, selector, value) }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::AutoreleasePool;
+        use std::{
+            ffi::c_void,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+
+        unsafe extern "C" fn record_pop(context: *mut c_void) {
+            // SAFETY: The test passes a live AtomicUsize pointer and drops the pool before it.
+            let pop_count = unsafe { &*context.cast::<AtomicUsize>() };
+            pop_count.fetch_add(1, Ordering::Relaxed);
+        }
+
+        #[test]
+        /// autorelease poolのdrop時に対応するpop処理を呼び出す。
+        // why: poolを解放しないと、繰り返しの表示名取得でautoreleased objectが蓄積するため。
+        fn autorelease_pool_drop_invokes_pop() {
+            let pop_count = AtomicUsize::new(0);
+            let pool = AutoreleasePool {
+                context: (&pop_count as *const AtomicUsize)
+                    .cast_mut()
+                    .cast::<c_void>(),
+                pop: record_pop,
+            };
+
+            drop(pool);
+
+            assert_eq!(pop_count.load(Ordering::Relaxed), 1);
+        }
     }
 }
 
