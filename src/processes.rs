@@ -769,11 +769,14 @@ mod tests {
     /// メモリ取得の時間切れ後もenergy取得には独立した時間枠を与える。
     // why: footprintの遅延だけでenergyカウンターの取得機会を失わないため。
     fn popup_energy_scan_gets_a_fresh_deadline_after_memory_times_out() {
+        let timeout = Duration::from_millis(30);
+        let earliest_deadline = Instant::now() + timeout;
         let scanned = scan_popup_sources_with_independent_deadlines(
             &[123],
             None,
-            Duration::from_millis(30),
+            timeout,
             |_, deadline, _| {
+                assert!(deadline >= earliest_deadline);
                 while Instant::now() <= deadline {
                     std::thread::yield_now();
                 }
@@ -806,6 +809,28 @@ mod tests {
         assert_eq!(
             parse_phys_footprint("phys_footprint: 1,712 KB\n"),
             Some(1_753_088)
+        );
+    }
+
+    #[test]
+    /// MB・GBのfootprint値をバイト数へ変換し、桁あふれは取得不能にする。
+    // why: 大きなプロセスのメモリ量を誤換算したり、overflow後の値を表示したりしないため。
+    fn parses_megabytes_and_gigabytes_as_bytes() {
+        assert_eq!(
+            parse_phys_footprint("phys_footprint: 1 MB\n"),
+            Some(1_048_576)
+        );
+        assert_eq!(
+            parse_phys_footprint("phys_footprint: 1 GB\n"),
+            Some(1_073_741_824)
+        );
+        assert_eq!(
+            parse_phys_footprint(&format!("phys_footprint: {} MB\n", u64::MAX)),
+            None
+        );
+        assert_eq!(
+            parse_phys_footprint(&format!("phys_footprint: {} GB\n", u64::MAX)),
+            None
         );
     }
 
@@ -1133,5 +1158,103 @@ Auxiliary data:
             !stderr.contains(DIAGNOSTIC),
             "child diagnostics must not reach the popup: {stderr}"
         );
+    }
+
+    #[test]
+    /// 子プロセスの終了状態と標準出力を取得する。
+    // why: 正常終了と異常終了の結果を呼び出し元が判定できるようにするため。
+    fn wait_for_child_returns_output_and_exit_status() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "printf partial; exit 7"])
+            .stdout(Stdio::piped());
+        let child = spawn_with_suppressed_stderr(command).expect("child must start");
+
+        let (status, output) = wait_for_child(child, Instant::now() + Duration::from_secs(1), None)
+            .expect("child result must be available");
+
+        assert!(!status.success());
+        assert_eq!(output, b"partial");
+    }
+
+    #[test]
+    /// キャンセル済みなら終了期限前でも子プロセスの結果を待たず中断する。
+    // why: popupを閉じた後に補助プロセスを走らせ続けないため。
+    fn wait_for_child_stops_when_cancelled() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 0.2"]).stdout(Stdio::piped());
+        let child = spawn_with_suppressed_stderr(command).expect("child must start");
+        let cancelled = AtomicBool::new(false);
+
+        assert!(wait_for_child(
+            child,
+            Instant::now() + Duration::from_secs(1),
+            Some(&cancelled),
+        )
+        .is_none());
+    }
+
+    #[test]
+    /// deadlineを過ぎた子プロセスを待ち続けずタイムアウトにする。
+    // why: 遅い補助コマンドがpopupの応答を止めないようにするため。
+    fn wait_for_child_stops_after_deadline() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 0.2"]).stdout(Stdio::piped());
+        let child = spawn_with_suppressed_stderr(command).expect("child must start");
+
+        assert!(wait_for_child(child, Instant::now() - Duration::from_millis(1), None,).is_none());
+    }
+
+    #[test]
+    /// stdoutの読み取りは空き状態を許容し、データを蓄積し、その他のエラーを返す。
+    // why: 非ブロッキングpipeの一時的なWouldBlockと実際の読み取り失敗を区別するため。
+    fn drain_available_handles_data_and_read_errors() {
+        struct ErrorReader(io::ErrorKind);
+
+        impl Read for ErrorReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from(self.0))
+            }
+        }
+
+        let mut output = Vec::new();
+        assert!(drain_available(&mut io::Cursor::new(b"result"), &mut output).is_ok());
+        assert_eq!(output, b"result");
+
+        let mut would_block = ErrorReader(io::ErrorKind::WouldBlock);
+        assert!(drain_available(&mut would_block, &mut output).is_ok());
+
+        let mut permission_denied = ErrorReader(io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            drain_available(&mut permission_denied, &mut output)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    /// stdoutのfile descriptorへO_NONBLOCKを設定する。
+    // why: 待機中の子プロセスから読み込む際にreadでpopupを停止させないため。
+    fn set_nonblocking_sets_descriptor_flag() {
+        unsafe extern "C" {
+            fn fcntl(fd: i32, command: i32, ...) -> i32;
+        }
+
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open("/dev/null")
+            .expect("/dev/null must be writable");
+        let fd = file.as_raw_fd();
+        let first_result = set_nonblocking(fd);
+        let second_result = set_nonblocking(fd);
+        // SAFETY: file remains open and is owned by this test while the flags are read.
+        let flags = unsafe { fcntl(fd, 3) };
+
+        assert!(first_result.is_ok());
+        assert!(second_result.is_ok());
+        assert_ne!(flags & 0x0004, 0);
+        assert_ne!(flags & 0x0008, 0);
     }
 }
