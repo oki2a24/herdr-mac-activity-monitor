@@ -362,7 +362,9 @@ fn read_cpu_ticks() -> Result<CpuTicks, String> {
     let mut idle = 0_u64;
     let mut nice = 0_u64;
     for cpu in values
-        .chunks_exact(CPU_STATE_MAX)
+        .as_chunks::<CPU_STATE_MAX>()
+        .0
+        .iter()
         .take(processor_count as usize)
     {
         user = user.saturating_add(u64::try_from(cpu[CPU_STATE_USER]).unwrap_or(0));
