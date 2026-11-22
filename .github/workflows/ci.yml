@@ -8,17 +8,21 @@ on:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    name: Verify (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-       - uses: actions/checkout@v4
-       - name: Install Rust toolchain
-         uses: dtolnay/rust-toolchain@stable
-         with:
-           components: rustfmt, clippy
-       - name: Cache
-         uses: Swatinem/rust-cache@v2
-       - name: Verify
-         run: make verify
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+      - name: Verify
+        run: make verify
 
   audit:
     runs-on: ubuntu-latest
