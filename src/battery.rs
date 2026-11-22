@@ -65,6 +65,31 @@ type CFDictionaryRef = *const std::ffi::c_void;
 type CFStringRef = *const std::ffi::c_void;
 
 #[cfg(target_os = "macos")]
+struct BatterySource {
+    dictionary: CFDictionaryRef,
+    is_internal: bool,
+    is_present: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn first_present_internal_battery<I, F>(sources: Option<I>, mut read_battery: F) -> Battery
+where
+    I: IntoIterator<Item = Option<BatterySource>>,
+    F: FnMut(CFDictionaryRef) -> Option<Battery>,
+{
+    let Some(sources) = sources else {
+        return Battery::Absent;
+    };
+
+    for source in sources.into_iter().flatten() {
+        if source.is_internal && source.is_present {
+            return read_battery(source.dictionary).unwrap_or(Battery::Absent);
+        }
+    }
+    Battery::Absent
+}
+
+#[cfg(target_os = "macos")]
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFArrayGetCount(array: CFArrayRef) -> isize;
@@ -171,26 +196,24 @@ fn get_snapshot_macos(include_runtime: bool) -> PowerSnapshot {
             .expect("static power source type")
             .as_c_str(),
     );
-    let battery = if list.is_null() || unsafe { CFArrayGetCount(list) } == 0 {
-        Battery::Absent
-    } else {
-        let mut battery = Battery::Absent;
-        for index in 0..unsafe { CFArrayGetCount(list) } {
+    let sources = (!list.is_null()).then(|| {
+        let count = unsafe { CFArrayGetCount(list) };
+        (0..count).map(|index| {
             let source = unsafe { CFArrayGetValueAtIndex(list, index) };
             let dict = unsafe { IOPSGetPowerSourceDescription(info, source) };
-            // 外部電源や未接続の電池を選ぶと、ノート型Macの実バッテリー表示が
-            // 0%や誤った状態になるため、InternalBatteryかつ接続中の電源だけを採用する。
-            if dict.is_null()
-                || !dictionary_string_equals(dict, type_key, internal_battery_type)
-                || !dictionary_bool(dict, present_key).unwrap_or(false)
-            {
-                continue;
+            if dict.is_null() {
+                return None;
             }
-            battery = battery_from_dictionary(dict).unwrap_or(Battery::Absent);
-            break;
-        }
-        battery
-    };
+            Some(BatterySource {
+                dictionary: dict,
+                is_internal: dictionary_string_equals(dict, type_key, internal_battery_type),
+                is_present: dictionary_bool(dict, present_key).unwrap_or(false),
+            })
+        })
+    });
+    // 外部電源や未接続の電池を選ぶと、ノート型Macの実バッテリー表示が
+    // 0%や誤った状態になるため、InternalBatteryかつ接続中の電源だけを採用する。
+    let battery = first_present_internal_battery(sources, battery_from_dictionary);
 
     unsafe {
         CFRelease(type_key);
@@ -355,9 +378,106 @@ mod tests {
     /// macOS固有の残り時間を示す特別な値と秒数を状態へ変換する。
     // why: OSの特別な値を通常の残り時間と区別するため。
     fn maps_iopower_sources_runtime_sentinels() {
-        assert_eq!(runtime_from_seconds(-1.0), RuntimeEstimate::Unknown);
-        assert_eq!(runtime_from_seconds(-2.0), RuntimeEstimate::Unlimited);
+        assert_eq!(K_IOPS_TIME_REMAINING_UNKNOWN, -1.0);
+        assert_eq!(K_IOPS_TIME_REMAINING_UNLIMITED, -2.0);
+        assert_eq!(
+            runtime_from_seconds(K_IOPS_TIME_REMAINING_UNKNOWN),
+            RuntimeEstimate::Unknown
+        );
+        assert_eq!(
+            runtime_from_seconds(K_IOPS_TIME_REMAINING_UNLIMITED),
+            RuntimeEstimate::Unlimited
+        );
         assert_eq!(runtime_from_seconds(61.9), RuntimeEstimate::Seconds(61));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    /// 特別値以外の負数と非有限値は推定不能として扱う。
+    // why: 不正な時間を0秒や有効な残り時間として表示しないため。
+    fn rejects_negative_and_non_finite_runtime_values() {
+        assert_eq!(runtime_from_seconds(-3.0), RuntimeEstimate::Unknown);
+        assert_eq!(runtime_from_seconds(f64::NAN), RuntimeEstimate::Unknown);
+        assert_eq!(
+            runtime_from_seconds(f64::INFINITY),
+            RuntimeEstimate::Unknown
+        );
+        assert_eq!(
+            runtime_from_seconds(f64::NEG_INFINITY),
+            RuntimeEstimate::Unknown
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    /// 0秒は有効値として保持し、正の小数は秒単位で切り捨てる。
+    // why: 0秒と不正な負数を区別し、表示する秒数の丸め方を固定するため。
+    fn preserves_zero_and_floors_fractional_runtime_seconds() {
+        assert_eq!(runtime_from_seconds(0.0), RuntimeEstimate::Seconds(0));
+        assert_eq!(runtime_from_seconds(0.9), RuntimeEstimate::Seconds(0));
+        assert_eq!(runtime_from_seconds(61.9), RuntimeEstimate::Seconds(61));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    /// 外部電源と未接続の内部電池を飛ばし、最初の有効な内部電池を選ぶ。
+    // why: 電源一覧の先頭にある外部電源や未接続電池を誤表示しないため。
+    fn selects_first_present_internal_battery_source() {
+        let markers = [0_u8; 4];
+        let pointer = |index: usize| &markers[index] as *const u8 as CFDictionaryRef;
+        let selected = pointer(3);
+        let candidates = Some(vec![
+            None,
+            Some(BatterySource {
+                dictionary: pointer(0),
+                is_internal: false,
+                is_present: true,
+            }),
+            Some(BatterySource {
+                dictionary: pointer(1),
+                is_internal: true,
+                is_present: false,
+            }),
+            Some(BatterySource {
+                dictionary: selected,
+                is_internal: true,
+                is_present: true,
+            }),
+        ]);
+        let mut read_dictionaries = Vec::new();
+
+        let battery = first_present_internal_battery(candidates, |dictionary| {
+            read_dictionaries.push(dictionary);
+            Some(Battery::Present {
+                percent: 81,
+                state: ChargingState::Discharging,
+            })
+        });
+
+        assert_eq!(
+            battery,
+            Battery::Present {
+                percent: 81,
+                state: ChargingState::Discharging,
+            }
+        );
+        assert_eq!(read_dictionaries, vec![selected]);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    /// 電源一覧がない場合はAbsentを返し、辞書を読み取らない。
+    // why: IOPowerSourcesがnilを返したときNULLを辿らず安全に終了するため。
+    fn returns_absent_when_power_source_list_is_missing() {
+        let mut read_called = false;
+
+        let battery = first_present_internal_battery(None::<Vec<Option<BatterySource>>>, |_| {
+            read_called = true;
+            None
+        });
+
+        assert_eq!(battery, Battery::Absent);
+        assert!(!read_called);
     }
 
     #[test]
